@@ -68,6 +68,8 @@ function createDb({ users, histories, dictionary, counters, jobs, articles, paym
   const chunks = (list) => { const out = []; for (let i = 0; i < list.length; i += CHUNK) out.push(list.slice(i, i + CHUNK)); return out; };
 
   const getUser = (email) => users.findOne({ email: norm(email) });
+  // One cheap read, used by /ping to prove the database answers (and to count as activity for an idle Atlas free cluster).
+  const ping = () => counters.findOne({ _id: "__ping__" });
 
   async function ensureHistory(userId) {
     if (await histories.findOne({ user_id: userId })) return;
@@ -497,7 +499,7 @@ function createDb({ users, histories, dictionary, counters, jobs, articles, paym
   // Puts a claimed link back to "created" (the grant itself failed), so it can be settled again.
   const releaseCheckout = (pid) => needPayments().updateOne({ pid, status: "granted" }, { $set: { status: "created" } });
 
-  return { recordPagePayment, releasePagePayment, saveCheckout, getCheckout, listCheckouts, claimCheckout, releaseCheckout, getUser, createUser, claimJob, getArticle, putArticle, updateArticleWords, finishJob, failJob, dropJob, getJob, ackJob, grantPremium, getHistory, getHistoryState, getHistoryDetails, addHistory, saveDictionary, getDetails, status, isActive, consume, refund, extendDays, addBonus, getRefCode, findByRefCode, claimReferral, reopenReferral, closeReferral, insertReward, getReward, deleteReward, listRewards, listPendingRewards, decideReward, undecideReward,
+  return { ping, recordPagePayment, releasePagePayment, saveCheckout, getCheckout, listCheckouts, claimCheckout, releaseCheckout, getUser, createUser, claimJob, getArticle, putArticle, updateArticleWords, finishJob, failJob, dropJob, getJob, ackJob, grantPremium, getHistory, getHistoryState, getHistoryDetails, addHistory, saveDictionary, getDetails, status, isActive, consume, refund, extendDays, addBonus, getRefCode, findByRefCode, claimReferral, reopenReferral, closeReferral, insertReward, getReward, deleteReward, listRewards, listPendingRewards, decideReward, undecideReward,
            constants: { TRIAL_DAYS, PREMIUM_DAYS, DAILY_QUOTA, FREE_WORDS }, addDays };
 }
 

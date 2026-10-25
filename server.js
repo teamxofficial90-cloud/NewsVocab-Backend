@@ -512,8 +512,29 @@ async function handleAck(req, res, user) {
   send(res, 200, { ok: true, removed: done });
 }
 
+// Keep-alive for an uptime monitor (UptimeRobot, cron-job.org): GET or HEAD /ping. The reply is tiny and carries no settings.
+// It also reads the database at most once every 6 hours, so an idle Atlas free cluster keeps seeing a connection.
+const DB_PING_EVERY_MS = 6 * 60 * 60 * 1000;
+const DB_PING_TIMEOUT_MS = 5000;
+let lastDbPing = { at: 0, ok: null };
+async function handlePing(req, res) {
+  const t = Date.now();
+  if (t - lastDbPing.at >= DB_PING_EVERY_MS) {
+    lastDbPing.at = t; // set first, so a burst of pings starts only one check
+    try {
+      await Promise.race([db.ping(), new Promise((_, rej) => setTimeout(() => rej(new Error("timed out")), DB_PING_TIMEOUT_MS).unref())]);
+      lastDbPing.ok = true;
+    } catch (e) {
+      lastDbPing.ok = false;
+      console.error("[ping] database check failed:", e && e.message || e);
+    }
+  }
+  send(res, 200, { ok: true, db: lastDbPing.ok });
+}
+
 async function route(req, res) {
   if (req.method === "OPTIONS") return send(res, 204, {});
+  if ((req.method === "GET" || req.method === "HEAD") && (req.url === "/ping" || req.url.startsWith("/ping?"))) return handlePing(req, res);
   if (req.method === "GET" && req.url === "/health") return send(res, 200, { ok: true, aiConfigured: !!process.env.GEMINI_API_KEY, authConfigured: !!process.env.GOOGLE_CLIENT_ID, paymentsConfigured: premium.configured(), paymentMode: premium.pageMode() ? "page" : premium.configured() ? "link" : "off", paymentWebhookConfigured: premium.webhookConfigured(), rewardsEnabled: rewards.config().enabled, model: MODEL, maxWordLimit: MAX_LIMIT, articleCache: { enabled: cacheOn, ...cacheStats }, queue: gate.stats() });
 
   if (req.method === "POST" && req.url === "/auth/google") return handleGoogleAuth(req, res);
@@ -562,6 +583,7 @@ async function start(collections, opts = {}) {
   db = createDb({ users: collections.users, histories: collections.histories, dictionary: collections.dictionary, counters: collections.counters, jobs: collections.jobs, articles: collections.articles, payments: collections.payments, rewards: collections.rewards, timezone: process.env.QUOTA_TIMEZONE, today: opts.today });
   cacheOn = process.env.ARTICLE_CACHE !== "off" && !!collections.articles; // ARTICLE_CACHE=off: every request goes to Gemini
   cacheTtlMs = (parseFloat(process.env.ARTICLE_CACHE_DAYS) > 0 ? parseFloat(process.env.ARTICLE_CACHE_DAYS) : 2) * 24 * 3600 * 1000;
+  lastDbPing = { at: 0, ok: null };
   hotArticles = createRecent(2000); pendingArticles.clear(); followerOf.clear(); Object.keys(cacheStats).forEach((k) => (cacheStats[k] = 0));
   gate = opts.gate || createGate({
     concurrency: Math.max(1, envInt("GEMINI_CONCURRENCY", 30)),
