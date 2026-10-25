@@ -1,0 +1,44 @@
+{
+  "enabled": true,
+  "referral": {
+    "enabled": true,
+    "title": "Refer a friend",
+    "description": "Share your code. When a friend signs up and enters it, your friend gets 7 days and you get 3 days, saved for your next Premium plan. You can earn from up to 5 friends.",
+    "days": 7,
+    "apply": "next_premium",
+    "maxReferrals": 5,
+    "ownerDays": 3
+  },
+  "rewards": [
+    {
+      "id": "review",
+      "enabled": true,
+      "title": "Rate and review NewsVocab",
+      "description": "Write a rating and review, then press \"I have done it\" and type the name shown on your review. After a quick check 3 days are added to your plan.",
+      "days": 3,
+      "url": "https://chromewebstore.google.com/",
+      "approval": "manual",
+      "apply": "now",
+      "proof": {
+        "type": "text",
+        "label": "The name shown on your review (and its date)",
+        "required": true
+      }
+    },
+    {
+      "id": "instagram",
+      "enabled": true,
+      "title": "Share NewsVocab on Instagram",
+      "description": "Post or share it on Instagram, then press \"I have done it\" and paste the link of your post. After a quick check 7 days are saved and added to your next Premium plan.",
+      "days": 7,
+      "url": "https://www.instagram.com/",
+      "approval": "manual",
+      "apply": "next_premium",
+      "proof": {
+        "type": "instagram_post",
+        "label": "Link to your Instagram post or reel",
+        "required": true
+      }
+    }
+  ]
+}

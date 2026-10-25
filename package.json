@@ -1,0 +1,17 @@
+{
+  "name": "newsvocab-backend",
+  "version": "1.2.0",
+  "private": true,
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test.js && node test-mark.js && node test-db.js && node test-auth.js && node test-queue.js && node test-cache.js && node test-premium.js && node test-rewards.js",
+    "test:load": "node test-load.js"
+  },
+  "dependencies": {
+    "mongodb": "^6.0.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
