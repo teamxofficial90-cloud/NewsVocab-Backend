@@ -55,7 +55,7 @@ const setConfig = (patch) => { // the developer edits the file; no restart
     check("the rewards endpoints need a login");
 
     const alice = await login("alice"); const bob = await login("bob"); const carol = await login("carol");
-    assert.equal(expiryOf("alice"), "2026-10-24", "trial: last valid day today + 4");
+    assert.equal(expiryOf("alice"), "2026-10-19", "no free days at signup: the account starts on the Free plan");
 
     // --- the developer's master switch ---
     setConfig((c) => { c.enabled = false; });
@@ -120,12 +120,12 @@ const setConfig = (patch) => { // the developer edits the file; no restart
     await call("POST", "/admin/rewards/decide", { email: "bob@gmail.com", reward: "review", approve: true }, null, admin);
     assert.equal(bonusOf("bob"), 5); r = await call("GET", "/auth/me", undefined, bob); assert.equal(r.body.account.active, false, "still Free: the reward gives no access by itself");
     r = await call("POST", "/api/vocab", { title: "t", text: "w ".repeat(150), wordLimit: 1 }, bob); assert.notEqual(r.status, 403, "a Free user still generates as before");
-    // the next Premium plan (a payment or the manual grant use the same code) = 21 days + the saved 5
+    // the next Premium plan (a payment or the manual grant use the same code) = 30 days + the saved 5
     r = await call("POST", "/admin/premium", { email: "bob@gmail.com" }, null, admin); assert.equal(r.status, 200);
-    assert.equal(expiryOf("bob"), addDays(today, 21 + 5), "21 days + 5 bonus days"); assert.equal(bonusOf("bob"), 0, "the saved days are used up");
-    assert.equal(r.body.account.validUntil, addDays(today, 20 + 5)); assert.equal(r.body.account.bonusDays, 0);
-    r = await call("POST", "/admin/premium", { email: "bob@gmail.com" }, null, admin); assert.equal(expiryOf("bob"), addDays(today, 21), "a second purchase has no bonus left to add");
-    check("reward days wait for the next Premium plan: 21 + saved days, used up once, and a Free user stays Free until then");
+    assert.equal(expiryOf("bob"), addDays(today, 30 + 5), "30 days + 5 bonus days"); assert.equal(bonusOf("bob"), 0, "the saved days are used up");
+    assert.equal(r.body.account.validUntil, addDays(today, 29 + 5)); assert.equal(r.body.account.bonusDays, 0);
+    r = await call("POST", "/admin/premium", { email: "bob@gmail.com" }, null, admin); assert.equal(expiryOf("bob"), addDays(today, 30 + 5), "a second purchase has no bonus left to add and never shortens the plan");
+    check("reward days wait for the next Premium plan: 30 + saved days, used up once, and a Free user stays Free until then");
 
     // --- automatic approval ---
     setConfig((c) => { c.rewards[0].approval = "auto"; });
@@ -208,10 +208,10 @@ const setConfig = (patch) => { // the developer edits the file; no restart
     // --- "apply": "now": the days go onto the CURRENT plan at once (not saved for the next Premium) ---
     setConfig((c) => { c.rewards[0].days = 3; c.rewards[0].apply = "now"; });
     r = await call("GET", "/api/rewards", undefined, alice); assert.equal(r.body.rewards.find((x) => x.id === "review").apply, "now"); assert.equal(r.body.rewards.find((x) => x.id === "instagram").apply, "next_premium");
-    const frank = await login("frank"); const f0 = expiryOf("frank"); assert.ok(today < f0, "frank is on his trial");
+    const frank = await login("frank"); const f0 = expiryOf("frank"); assert.ok(!(today < f0), "frank starts on the Free plan (no free days at signup)");
     r = await call("POST", "/api/rewards/claim", { id: "review", proof: P("review") }, frank); assert.equal(r.body.status, "pending"); assert.equal(r.body.apply, "now"); assert.equal(expiryOf("frank"), f0, "manual: nothing before the approval");
     r = await call("POST", "/admin/rewards/decide", { email: "frank@gmail.com", reward: "review", approve: true }, null, admin); assert.equal(r.body.status, "granted"); assert.equal(r.body.apply, "now");
-    assert.equal(expiryOf("frank"), addDays(f0, 3), "3 days are added to the end of the current plan"); assert.equal(bonusOf("frank"), 0, "nothing is saved for the next Premium");
+    assert.equal(expiryOf("frank"), addDays(today, 3), "3 days from today (an expired plan restarts today)"); assert.equal(bonusOf("frank"), 0, "nothing is saved for the next Premium");
     r = await call("POST", "/api/rewards/claim", { id: "instagram", proof: P("instagram") }, frank); await call("POST", "/admin/rewards/decide", { email: "frank@gmail.com", reward: "instagram", approve: true }, null, admin);
     assert.equal(expiryOf("frank"), addDays(f0, 3), "Instagram is still saved for the next Premium"); assert.equal(bonusOf("frank"), 5);
     check("apply now: the review's 3 days go onto the current plan after the approval, while Instagram is still saved for the next Premium");

@@ -195,7 +195,7 @@ async function accountStatus(user) {
 }
 
 // One button for everyone: if the verified Gmail is already in the database the user is logged in,
-// otherwise an account (5-day trial) is created for it.
+// otherwise an account is created for it (no free days: the 3-day trial costs Rs. 1, see premium.js).
 async function handleGoogleAuth(req, res) {
   const body = await readJson(req, res); if (!body) return;
   try {
@@ -210,7 +210,7 @@ async function handleGoogleAuth(req, res) {
   }
 }
 
-// Manual grant (support, refunds, tests): the user gets 21 days (today + 20) from today. Normal purchases go through Razorpay instead (see premium.js).
+// Manual grant (support, refunds, tests): the user gets 30 days (today + 29) from today. Normal purchases go through Razorpay instead (see premium.js).
 // Checks the x-admin-key header; answers the request itself and returns false when it is not allowed.
 function adminOk(req, res) {
   const given = String(req.headers["x-admin-key"] || "");
@@ -268,9 +268,13 @@ async function handleRazorpayWebhook(req, res) {
   }
 }
 
-// The popup's Get Premium button: creates a Rs. 9.00 Razorpay payment page for this user and returns its address.
-async function handleCheckout(res, user) {
-  try { const r = await premium.createCheckout(user); send(res, 200, { url: r.url, ...(r.pageMode ? { pageMode: true, email: user.email } : {}) }); }
+// The popup's Get Premium / Start trial button: creates a Razorpay payment page for this user (Rs. 14 Premium, or the Rs. 1 trial for
+// body { plan: "trial" }; no body = Premium) and returns its address.
+async function handleCheckout(req, res, user) {
+  const raw = await readRaw(req, res); if (!raw) return;
+  let plan = "premium";
+  try { const b = raw.length ? JSON.parse(raw.toString("utf8")) : {}; if (b && b.plan === "trial") plan = "trial"; } catch (e) { return send(res, 400, { error: "Invalid JSON body." }); }
+  try { const r = await premium.createCheckout(user, plan); send(res, 200, { url: r.url, ...(r.pageMode ? { pageMode: true, email: user.email } : {}) }); }
   catch (e) { console.error("[checkout]", e.message); send(res, e.status || 500, { error: e.friendly ? e.message : "Could not start the payment. Please try again." }); }
 }
 
@@ -563,7 +567,7 @@ async function route(req, res) {
   if (req.url === "/api/rewards/claim") return handleRewardClaim(req, res, user);
   if (req.url === "/api/rewards/redeem") return handleRewardRedeem(req, res, user);
   if (req.url === "/api/referral/skip") return handleReferralSkip(res, user);
-  if (req.url === "/api/premium/checkout") return handleCheckout(res, user);
+  if (req.url === "/api/premium/checkout") return handleCheckout(req, res, user);
   if (req.url === "/api/premium/verify") return handleVerifyPayment(res, user);
   return handleVocab(req, res, user);
 }
@@ -607,6 +611,7 @@ async function start(collections, opts = {}) {
   if (!premium.configured()) console.warn("WARNING: neither RAZORPAY_PAYMENT_PAGE_URL nor RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET is set; the Get Premium button cannot start a payment until one is.");
   else if (premium.pageMode() && !premium.webhookConfigured()) console.warn("WARNING: RAZORPAY_PAYMENT_PAGE_URL is set but RAZORPAY_WEBHOOK_SECRET is not: a payment made on the page can only be confirmed by the webhook, so no plan will be extended until you add it.");
   else if (!premium.webhookConfigured()) console.warn("NOTE: RAZORPAY_WEBHOOK_SECRET is not set; payments are confirmed only when the popup checks (no webhook).");
+  if (premium.pageMode() && !(process.env.RAZORPAY_PAYMENT_PAGE_URL && process.env.RAZORPAY_TRIAL_PAGE_URL)) console.warn("WARNING: payment page mode needs BOTH RAZORPAY_PAYMENT_PAGE_URL (Rs. 14 Premium page) and RAZORPAY_TRIAL_PAGE_URL (Rs. 1 trial page); the plan whose page is missing cannot be bought.");
   if (!process.env.GOOGLE_CLIENT_ID) console.warn("WARNING: GOOGLE_CLIENT_ID is not set; nobody can sign in until it is.");
   if (!process.env.SESSION_SECRET) console.warn("WARNING: SESSION_SECRET is not set; a random one is used, so users are logged out on every restart.");
   return server;

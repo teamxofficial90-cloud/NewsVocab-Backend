@@ -1,25 +1,29 @@
-// Premium purchase through Razorpay (Rs. 9.00 -> the plan runs until today + 20 days, i.e. 21 days counting today).
+// Paid plans through Razorpay: the 3-day trial (Rs. 1, once per account, the plan runs until today + 2) and Premium (Rs. 14, until today + 29,
+// i.e. 30 days counting today). The amount paid decides the plan, and the expiry date is set by db.grantTrial / db.grantPremium.
 //
 // Flow
-//   1. The popup's "Get Premium" button calls POST /api/premium/checkout. The backend creates a Razorpay PAYMENT LINK for exactly
-//      Rs. 9.00 (900 paise, INR, no partial payment) and stores it in `payments` together with the user it belongs to.
+//   1. The popup's "Get Premium" / "Start 3-day trial" button calls POST /api/premium/checkout { plan: "premium" | "trial" }. The backend creates a Razorpay PAYMENT LINK for exactly
+//      the price of that plan (Rs. 14 = 1400 paise, or Rs. 1 = 100 paise; INR, no partial payment) and stores it in `payments` together with the user it belongs to.
 //      The popup opens the link's short_url in a new tab: that is the Razorpay payment page.
 //   2. When the user has paid, the plan is extended in one of two ways. Both end in settle(), so a payment can never count twice:
 //        a) Razorpay's webhook (event payment_link.paid) calls POST /webhook/razorpay. The HMAC signature is checked first.
 //        b) The popup calls POST /api/premium/verify (when it opens with an expired plan, and from the "I have paid" button).
 //           The backend asks Razorpay's API for the state of the user's own payment links. This works without a public URL.
-//   3. settle() grants the plan only if: the payment link is one WE created, the amount paid is exactly 900 paise, the currency is
+//   3. settle() grants the plan only if: the payment link is one WE created, the amount paid is exactly the price of the plan the link was created for, the currency is
 //      INR, and this link has not been used for a grant before (compare-and-set on `payments.status`).
 // The user is always taken from our own `payments` record, never from anything the webhook or the page says.
 //
-// PAYMENT PAGE MODE (RAZORPAY_PAYMENT_PAGE_URL set): the owner's own Razorpay Payment Page (fixed amount Rs. 9.00, asks for email and phone) is
-// used instead of generated links. Nothing is created through the Razorpay API (no API keys needed). The page is the same for everybody,
+// PAYMENT PAGE MODE (RAZORPAY_PAYMENT_PAGE_URL and/or RAZORPAY_TRIAL_PAGE_URL set): the owner's own Razorpay Payment Pages (a fixed amount of Rs. 14 for
+// Premium, a fixed amount of Rs. 1 for the trial; each asks for email and phone) are used instead of generated links.
+// The plan is recognised by the AMOUNT of the captured payment (100 paise = trial, 1400 paise = Premium). Nothing is created through the Razorpay API (no API keys needed). The page is the same for everybody,
 // so the payer is recognised by the EMAIL typed on the page, which must be the Gmail address of the account. Only the webhook can confirm
 // such a payment (event payment.captured). A payment whose email matches no account is stored with status "unmatched" and extends nothing
-// (grant it by hand with POST /admin/premium). The same checks apply: captured, exactly 900 paise, INR, one payment id counts once.
+// (grant it by hand with POST /admin/premium). The same checks apply: captured, exactly 100 or 1400 paise, INR, one payment id counts once. A trial payment of an account that has used its trial is stored as "trial_used" and extends nothing.
 const crypto = require("crypto");
 
-const PRICE_PAISE = 900;          // Rs. 9.00
+const PLANS = { trial: { paise: 100, days: 3, label: "3-day trial" }, premium: { paise: 1400, days: 30, label: "Premium - 30 days" } }; // Rs. 1 and Rs. 14
+const PRICE_PAISE = PLANS.premium.paise;  // Rs. 14.00 (kept for the code that only knows the Premium price)
+const planOf = (p) => (p === "trial" ? "trial" : "premium");
 const CURRENCY = "INR";
 const LINK_HOURS = 24;            // an unpaid payment link stops working after this long
 const RAZORPAY_TIMEOUT_MS = 15000;
@@ -32,12 +36,13 @@ function createPremium({ db, env = process.env, now = Date.now }) {
     webhookSecret: env.RAZORPAY_WEBHOOK_SECRET || "",
     base: (env.RAZORPAY_BASE_URL || "https://api.razorpay.com").replace(/\/$/, ""),
     callbackUrl: env.RAZORPAY_CALLBACK_URL || "",
-    pageUrl: (env.RAZORPAY_PAYMENT_PAGE_URL || "").trim(),
+    pageUrl: (env.RAZORPAY_PAYMENT_PAGE_URL || "").trim(),          // Premium page (Rs. 14)
+    trialPageUrl: (env.RAZORPAY_TRIAL_PAGE_URL || "").trim(),       // trial page (Rs. 1)
     pageMatch: (env.RAZORPAY_PAGE_MATCH || "").trim().toLowerCase(),
     verifyMinMs: env.RAZORPAY_VERIFY_MIN_MS !== undefined && Number.isFinite(Number(env.RAZORPAY_VERIFY_MIN_MS)) ? Number(env.RAZORPAY_VERIFY_MIN_MS) : 3000
   });
-  const pageMode = () => !!cfg().pageUrl;
-  const configured = () => { const c = cfg(); return !!(c.pageUrl || (c.keyId && c.keySecret)); };
+  const pageMode = () => !!(cfg().pageUrl || cfg().trialPageUrl);
+  const configured = () => { const c = cfg(); return !!(c.pageUrl || c.trialPageUrl || (c.keyId && c.keySecret)); };
   const webhookConfigured = () => !!cfg().webhookSecret;
 
   const fail = (message, status) => { const e = new Error(message); e.status = status || 502; e.friendly = true; return e; };
@@ -64,32 +69,35 @@ function createPremium({ db, env = process.env, now = Date.now }) {
   // ----- step 1: the payment page -----
 
   // Returns { url, linkId, reused }. A payment link that is still open for this user is shown again instead of creating another one.
-  async function createCheckout(user) {
+  async function createCheckout(user, planName) {
     if (!configured()) throw fail("Payments are not set up on the server yet.", 503);
-    if (pageMode()) { // the owner's own payment page: the same address for everybody
-      const url = cfg().pageUrl;
-      if (!/^https:\/\/\S+$/i.test(url)) throw fail("RAZORPAY_PAYMENT_PAGE_URL on the server must be a full https:// address.", 503);
+    const plan = planOf(planName);
+    if (plan === "trial" && user.trial_used !== false) throw fail("The 3-day trial has already been used on this account.", 409);
+    if (pageMode()) { // the owner's own payment pages: the same address for everybody (one page per plan)
+      const url = plan === "trial" ? cfg().trialPageUrl : cfg().pageUrl;
+      if (!url) throw fail("This payment is not set up on the server yet.", 503);
+      if (!/^https:\/\/\S+$/i.test(url)) throw fail((plan === "trial" ? "RAZORPAY_TRIAL_PAGE_URL" : "RAZORPAY_PAYMENT_PAGE_URL") + " on the server must be a full https:// address.", 503);
       return { url, linkId: null, reused: false, pageMode: true };
     }
-    const open = (await db.listCheckouts(user._id)).find((c) => new Date(c.expires_at).getTime() > now() + 60 * 1000);
+    const open = (await db.listCheckouts(user._id)).find((c) => planOf(c.plan) === plan && new Date(c.expires_at).getTime() > now() + 60 * 1000);
     if (open) return { url: open.url, linkId: open.pid, reused: true };
 
     const c = cfg();
     const t = now();
     const expireBy = Math.floor(t / 1000) + LINK_HOURS * 3600;
     const body = {
-      amount: PRICE_PAISE, currency: CURRENCY, accept_partial: false,
+      amount: PLANS[plan].paise, currency: CURRENCY, accept_partial: false,
       reference_id: "nv_" + crypto.randomBytes(8).toString("hex"),
-      description: "NewsVocab Premium - " + (db.constants.PREMIUM_DAYS + 1) + " days",
+      description: "NewsVocab " + (plan === "trial" ? "trial - " + (db.constants.TRIAL_DAYS + 1) : "Premium - " + (db.constants.PREMIUM_DAYS + 1)) + " days",
       customer: { email: user.email },
       notify: { email: false, sms: false }, reminder_enable: false,
       expire_by: expireBy,
-      notes: { email: user.email, purpose: "newsvocab_premium" }
+      notes: { email: user.email, purpose: "newsvocab_" + plan }
     };
     if (c.callbackUrl) { body.callback_url = c.callbackUrl; body.callback_method = "get"; }
     const link = await rzp("POST", "/v1/payment_links", body);
     if (!link || !link.id || !link.short_url) throw fail("Razorpay did not return a payment page. Please try again.");
-    await db.saveCheckout({ pid: link.id, user_id: user._id, email: user.email, amount: PRICE_PAISE, currency: CURRENCY, status: "created", url: link.short_url, created: new Date(t), expires_at: new Date(expireBy * 1000) });
+    await db.saveCheckout({ pid: link.id, user_id: user._id, email: user.email, plan, amount: PLANS[plan].paise, currency: CURRENCY, status: "created", url: link.short_url, created: new Date(t), expires_at: new Date(expireBy * 1000) });
     return { url: link.short_url, linkId: link.id, reused: false };
   }
 
@@ -100,13 +108,15 @@ function createPremium({ db, env = process.env, now = Date.now }) {
     const co = await db.getCheckout(linkId);
     if (!co) return { ok: false, reason: "UNKNOWN_LINK" };               // not a link this server created
     if (co.status === "granted") return { ok: true, granted: false };     // already used: a repeated webhook or a second check
-    if (amountPaid !== PRICE_PAISE || co.amount !== PRICE_PAISE) return { ok: false, reason: "AMOUNT" };
+    const plan = planOf(co.plan), price = PLANS[plan].paise; // a link created before the trial existed has no plan: it is a Premium link
+    if (amountPaid !== price || co.amount !== price) return { ok: false, reason: "AMOUNT" };
     if (currency !== CURRENCY) return { ok: false, reason: "CURRENCY" };
     if (!(await db.claimCheckout(linkId, { payment_id: paymentId || "", paid_at: new Date(now()), source }))) return { ok: true, granted: false }; // another request got there first
     try {
-      const user = await db.grantPremium(co.email);
+      const user = plan === "trial" ? await db.grantTrial(co.email) : await db.grantPremium(co.email);
+      if (user === false) { console.warn("[premium] trial paid by an account that already used it (handle by hand):", co.email, linkId); return { ok: false, reason: "TRIAL_USED" }; }
       if (!user) throw new Error("No account for " + co.email);
-      return { ok: true, granted: true, email: user.email };
+      return { ok: true, granted: true, email: user.email, plan };
     } catch (e) {
       await db.releaseCheckout(linkId).catch(() => {}); // let the next webhook retry / check try again
       throw e;
@@ -117,22 +127,32 @@ function createPremium({ db, env = process.env, now = Date.now }) {
   async function settlePagePayment(pay, source) {
     if (!pay || !pay.id) return { ok: false, reason: "INCOMPLETE" };
     if (pay.status !== "captured") return { ok: false, reason: "NOT_PAID" };
-    if (pay.amount !== PRICE_PAISE) return { ok: false, reason: "AMOUNT" };
+    const plan = pay.amount === PLANS.trial.paise ? "trial" : pay.amount === PLANS.premium.paise ? "premium" : null; // the amount decides the plan
+    if (!plan) return { ok: false, reason: "AMOUNT" };
     if (pay.currency !== CURRENCY) return { ok: false, reason: "CURRENCY" };
     const must = cfg().pageMatch; // optional: only payments of this page (text found in the payment's description or notes)
     if (must && !(String(pay.description || "") + " " + JSON.stringify(pay.notes || {})).toLowerCase().includes(must)) return { ok: false, reason: "OTHER_PAYMENT" };
     const email = String(pay.email || "").trim().toLowerCase();
     const user = email ? await db.getUser(email) : null;
-    const base = { pid: pay.id, kind: "page", email, amount: pay.amount, currency: pay.currency, payment_id: pay.id, contact: String(pay.contact || ""), paid_at: new Date(now()), source };
+    const base = { pid: pay.id, kind: "page", plan, email, amount: pay.amount, currency: pay.currency, payment_id: pay.id, contact: String(pay.contact || ""), paid_at: new Date(now()), source };
     if (!user) { // nobody has this email: keep the record so it can be handled by hand, extend nothing
       await db.recordPagePayment({ ...base, status: "unmatched" });
       return { ok: false, reason: "NO_ACCOUNT" };
     }
+    if (plan === "trial" && user.trial_used !== false) { // paid for a trial this account already had: keep the record, extend nothing
+      await db.recordPagePayment({ ...base, status: "trial_used", user_id: user._id });
+      return { ok: false, reason: "TRIAL_USED" };
+    }
     if (!(await db.recordPagePayment({ ...base, status: "granted", user_id: user._id }))) return { ok: true, granted: false }; // this payment id was handled before
     try {
-      const granted = await db.grantPremium(email);
+      const granted = plan === "trial" ? await db.grantTrial(email) : await db.grantPremium(email);
+      if (granted === false) { // the trial was used by another payment a moment ago
+        await db.releasePagePayment(pay.id).catch(() => {});
+        await db.recordPagePayment({ ...base, status: "trial_used", user_id: user._id });
+        return { ok: false, reason: "TRIAL_USED" };
+      }
       if (!granted) throw new Error("No account for " + email);
-      return { ok: true, granted: true, email };
+      return { ok: true, granted: true, email, plan };
     } catch (e) {
       await db.releasePagePayment(pay.id).catch(() => {}); // let Razorpay's retry of the webhook try again
       throw e;
@@ -193,7 +213,7 @@ function createPremium({ db, env = process.env, now = Date.now }) {
     return { granted };
   }
 
-  return { configured, pageMode, webhookConfigured, createCheckout, handleWebhook, verifyForUser, settle, PRICE_PAISE };
+  return { configured, pageMode, webhookConfigured, createCheckout, handleWebhook, verifyForUser, settle, PRICE_PAISE, PLANS };
 }
 
-module.exports = { createPremium, PRICE_PAISE, CURRENCY };
+module.exports = { createPremium, PRICE_PAISE, PLANS, CURRENCY };

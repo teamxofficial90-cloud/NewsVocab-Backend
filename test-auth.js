@@ -70,10 +70,13 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     // --- one button: new Gmail = signup, known Gmail = login ---
     r = await call("POST", "/auth/google", { idToken: pad("alice") });
     assert.equal(r.status, 200); assert.equal(r.body.isNewUser, true); assert.equal(r.body.user.email, "alice@gmail.com");
-    assert.equal(r.body.account.remainingToday, 13); assert.equal(r.body.account.validUntil, "2026-10-23", "5 trial days: signup day + 4");
+    assert.equal(r.body.account.remainingToday, 13); assert.equal(r.body.account.validUntil, "2026-10-18", "no free days: a new account starts on the Free plan");
+    assert.equal(r.body.account.active, false); assert.equal(r.body.account.trialUsed, false, "the Rs. 1 trial is offered");
     const session = r.body.token;
     assert.equal(cols.users.docs.length, 1); assert.equal(cols.histories.docs.length, 1, "one history document per user");
-    assert.equal(cols.users.docs[0].expiry_date, "2026-10-24"); assert.equal(cols.users.docs[0].daily_quota, 13);
+    assert.equal(cols.users.docs[0].expiry_date, "2026-10-19"); assert.equal(cols.users.docs[0].daily_quota, 13); assert.equal(cols.users.docs[0].trial_used, false);
+    // The Rs. 1 trial (3 days: 2026-10-19 .. 2026-10-21) is bought through Razorpay (see test-premium.js); here it is set directly so the rest of this test runs on the full plan.
+    cols.users.docs[0].expiry_date = "2026-10-22"; cols.users.docs[0].trial_used = true;
     r = await call("POST", "/auth/google", { idToken: pad("alice") });
     assert.equal(r.status, 200); assert.equal(r.body.isNewUser, false, "second time is a login");
     assert.equal(cols.users.docs.length, 1, "still one account"); assert.equal(cols.histories.docs.length, 1);
@@ -244,13 +247,13 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     await call("POST", "/api/vocab/ack", { jobId: "test-job-0008" }, session);
     assert.equal(cols.users.docs[0].daily_quota >= 0, true);
 
-    // --- the last trial day (signup + 4) is still the full plan ---
-    today = "2026-10-23";
+    // --- the last trial day (trial bought on signup day + 2) is still the full plan ---
+    today = "2026-10-21";
     r = await call("GET", "/auth/me", null, session); assert.equal(r.body.account.active, true);
     r = await call("GET", "/api/history", null, session); assert.equal(r.status, 200, "history download works on the last trial day");
 
     // --- the trial ends on expiry_date: the Free plan (same quota; the popup shows 3 words; no history download) ---
-    today = "2026-10-24"; // = expiry_date
+    today = "2026-10-22"; // = expiry_date
     r = await call("GET", "/auth/me", null, session); assert.equal(r.body.account.active, false); assert.equal(r.body.account.freeWords, 3);
     r = await call("POST", "/api/vocab", { ...article, wordLimit: 5 }, session);
     assert.equal(r.status, 200, "an expired account can still generate"); assert.equal(r.body.free, true);
@@ -258,12 +261,12 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     assert.equal(r.body.quota.remainingToday, 13 - r.body.words.length, "same daily quota of 13: every word returned is charged");
     r = await call("GET", "/api/history", null, session); assert.equal(r.status, 403); assert.equal(r.body.code, "PLAN_EXPIRED");
 
-    // --- premium: 21 days counting today ---
+    // --- premium: 30 days counting today ---
     r = await call("POST", "/admin/premium", { email: "alice@gmail.com" }); assert.equal(r.status, 401, "admin key required");
     r = await call("POST", "/admin/premium", { email: "alice@gmail.com" }, null, { "x-admin-key": "wrong" }); assert.equal(r.status, 401);
     r = await call("POST", "/admin/premium", { email: "nobody@gmail.com" }, null, { "x-admin-key": "adm1n" }); assert.equal(r.status, 404);
     r = await call("POST", "/admin/premium", { email: "Alice@gmail.com" }, null, { "x-admin-key": "adm1n" });
-    assert.equal(r.status, 200); assert.equal(r.body.account.validUntil, addDays(today, 20), "21 days including today");
+    assert.equal(r.status, 200); assert.equal(r.body.account.validUntil, addDays(today, 29), "30 days including today");
     r = await call("GET", "/api/history", null, session); assert.equal(r.status, 200, "history download is unlocked by premium");
     r = await call("POST", "/api/vocab", { ...article, wordLimit: 1 }, session); assert.equal(r.status, 200, "premium user can generate again");
 

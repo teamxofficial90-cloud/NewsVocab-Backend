@@ -11,13 +11,19 @@ async function suite(collections) {
   const db = createDb({ users: collections.users, histories: collections.histories, dictionary: collections.dictionary, counters: collections.counters, today: () => now });
   const email = "user@gmail.com";
 
-  // signup: 5 trial days (today + 4 is the last valid day), quota 13, never used; plus an empty history document
+  // signup: no free days (the Free plan from the start), the Rs. 1 trial not bought yet, quota 13, never used; plus an empty history document
   let u = await db.createUser("User@Gmail.com");
-  assert.strictEqual(u.email, email); assert.strictEqual(u.expiry_date, "2026-10-24");
+  assert.strictEqual(u.email, email); assert.strictEqual(u.expiry_date, "2026-10-19"); assert.strictEqual(u.trial_used, false);
   assert.strictEqual(u.daily_quota, 13); assert.strictEqual(u.last_used, null);
   assert.deepStrictEqual(await db.getHistory(u._id), []);
   assert.strictEqual((await db.createUser(email))._id.toString(), u._id.toString(), "signing up twice keeps the first account");
-  let st = await db.status(u); assert.strictEqual(st.remainingToday, 13); assert.strictEqual(st.validUntil, "2026-10-23"); assert.strictEqual(st.active, true); assert.strictEqual(st.freeWords, 3);
+  let st = await db.status(u); assert.strictEqual(st.remainingToday, 13); assert.strictEqual(st.validUntil, "2026-10-18"); assert.strictEqual(st.active, false, "a new account starts on the Free plan"); assert.strictEqual(st.trialUsed, false); assert.strictEqual(st.freeWords, 3);
+
+  // the paid trial: 3 days counting today (today + 2 is the last valid day), once per account
+  u = await db.grantTrial(email); assert.strictEqual(u.expiry_date, "2026-10-22"); assert.strictEqual(u.trial_used, true);
+  st = await db.status(u); assert.strictEqual(st.active, true); assert.strictEqual(st.validUntil, "2026-10-21"); assert.strictEqual(st.trialUsed, true);
+  assert.strictEqual(await db.grantTrial(email), false, "the trial can be bought only once"); assert.strictEqual((await db.getUser(email)).expiry_date, "2026-10-22");
+  assert.strictEqual(await db.grantTrial("nobody@gmail.com"), null);
 
   // first request today: 8 words -> 5 left, last_used today (saved before output)
   let r = await db.consume(email, 8); assert.ok(r.ok); assert.strictEqual(r.remaining, 5);
@@ -38,10 +44,10 @@ async function suite(collections) {
   r = await db.consume(email, 13); assert.ok(r.ok); assert.strictEqual(r.remaining, 0);
   assert.strictEqual((await db.getUser(email)).last_used, "2026-10-20");
 
-  // the last trial day (today + 6) still works
-  now = "2026-10-23"; assert.ok((await db.consume(email, 1)).ok, "day 5 of the trial still works"); assert.ok(db.isActive(await db.getUser(email)));
+  // the last trial day (today + 2) still works
+  now = "2026-10-21"; assert.ok((await db.consume(email, 1)).ok, "day 3 of the trial still works"); assert.ok(db.isActive(await db.getUser(email)));
   // the day after: expired = the Free plan
-  now = "2026-10-24";
+  now = "2026-10-22";
   r = await db.consume(email, 1); assert.ok(!r.ok); assert.strictEqual(r.reason, "EXPIRED");
   assert.strictEqual((await db.status(await db.getUser(email))).active, false); assert.ok(!db.isActive(await db.getUser(email)));
   // the Free plan may still use the daily quota when the caller allows it (the server caps it at 3 words)
@@ -49,18 +55,19 @@ async function suite(collections) {
   assert.strictEqual(db.constants.FREE_WORDS, 3);
   await db.refund(email, 3);
 
-  // premium: 21 days counting today (today + 20 is the last valid day: valid 2026-10-24 .. 2026-11-13)
-  u = await db.grantPremium(email); assert.strictEqual(u.expiry_date, "2026-11-14");
-  assert.strictEqual((await db.status(u)).validUntil, "2026-11-13");
+  // premium: 30 days counting today (today + 29 is the last valid day: valid 2026-10-22 .. 2026-11-20)
+  u = await db.grantPremium(email); assert.strictEqual(u.expiry_date, "2026-11-21");
+  assert.strictEqual((await db.status(u)).validUntil, "2026-11-20");
   assert.ok((await db.consume(email, 13)).ok, "usable again right after buying premium");
-  now = "2026-11-13"; assert.ok((await db.consume(email, 1)).ok, "last premium day still works");
-  now = "2026-11-14"; assert.strictEqual((await db.consume(email, 1)).reason, "EXPIRED");
+  now = "2026-11-20"; assert.ok((await db.consume(email, 1)).ok, "last premium day still works");
+  now = "2026-11-21"; assert.strictEqual((await db.consume(email, 1)).reason, "EXPIRED");
 
   // bonus days (rewards) are saved and only used by the next premium plan
   now = "2026-12-01"; await db.addBonus(email, 5); await db.addBonus(email, 7); u = await db.getUser(email); assert.strictEqual(u.bonus_days, 12);
-  assert.strictEqual(u.expiry_date, "2026-11-14", "bonus days do not change the plan"); assert.strictEqual((await db.status(u)).bonusDays, 12); assert.strictEqual(await db.addBonus("nobody@gmail.com", 1), null);
-  u = await db.grantPremium(email); assert.strictEqual(u.expiry_date, "2027-01-03", "21 days + 12 bonus days from 2026-12-01"); assert.strictEqual(u.bonus_days, 0);
-  u = await db.grantPremium(email); assert.strictEqual(u.expiry_date, "2026-12-22", "the bonus is used up after one plan (21 days)");
+  assert.strictEqual(u.expiry_date, "2026-11-21", "bonus days do not change the plan"); assert.strictEqual((await db.status(u)).bonusDays, 12); assert.strictEqual(await db.addBonus("nobody@gmail.com", 1), null);
+  u = await db.grantPremium(email); assert.strictEqual(u.expiry_date, "2027-01-12", "30 days + 12 bonus days from 2026-12-01"); assert.strictEqual(u.bonus_days, 0);
+  u = await db.grantPremium(email); assert.strictEqual(u.expiry_date, "2027-01-12", "buying again never shortens a plan that runs longer (and the bonus is already used up)");
+  assert.strictEqual(u.bonus_days, 0);
   await Promise.all([db.addBonus(email, 1), db.addBonus(email, 1), db.addBonus(email, 1)]); assert.strictEqual((await db.getUser(email)).bonus_days, 3, "simultaneous rewards all count");
   await db.grantPremium(email);
 

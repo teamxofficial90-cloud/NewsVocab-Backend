@@ -21,9 +21,11 @@
 // tests pass in-memory stand-ins (memory-db.js) that offer the same few methods.
 //
 // Rules
-//  - Signup: last valid day = today + 4 (5 trial days), so expiry_date = today + 5; daily_quota = 13, last_used = empty,
+//  - Signup: NO free days. expiry_date = today (the Free plan) and trial_used = false (the one Rs. 1 trial may still be bought); daily_quota = 13, last_used = empty,
 //    ref_pending = true (the one chance to enter a friend's referral code, see rewards.js; ends when the code is used or skipped).
-//  - Premium: last valid day = today + 20 (21 days), so expiry_date = today + 21, plus any saved bonus days (rewards, see rewards.js).
+//  - Trial (Rs. 1, once per account, see grantTrial): last valid day = today + 2 (3 days), so expiry_date = today + 3. Saved bonus days are NOT used by it.
+//  - Premium (Rs. 14): last valid day = today + 29 (30 days), so expiry_date = today + 30, plus any saved bonus days (rewards, see rewards.js).
+//    A payment never shortens a plan: if the account already runs longer than the new plan would, the later date is kept.
 //  - The full plan ("Premium" in the popup, trial included) works on every date strictly before expiry_date. After that the account
 //    is on the "Free" plan: it generates exactly like before (same 1-13 range, same daily quota of 13, all words saved to the
 //    history), but the popup shows only the first FREE_WORDS (3) words, and the history download is refused (the popup also locks the DOCX).
@@ -34,9 +36,9 @@
 //  - Older histories (`words: ["stringent", ...]` as text, or `entries: [{ word, meaning }]`) are still read, and are
 //    converted to numbers the next time words are added (their details in the old string-keyed dictionary documents are kept).
 const { pack, unpack, MAX_ID } = require("./pack");
-// TRIAL_DAYS / PREMIUM_DAYS: the LAST valid day is today + N, so the plan covers N + 1 days counting today (4 -> 5 trial days, 20 -> 21 premium days).
+// TRIAL_DAYS / PREMIUM_DAYS: the LAST valid day is today + N, so the plan covers N + 1 days counting today (2 -> 3 trial days, 29 -> 30 premium days).
 // expiry_date (stored) is the first day the plan no longer works, i.e. today + N + 1.
-const TRIAL_DAYS = 4, PREMIUM_DAYS = 20, DAILY_QUOTA = 13;
+const TRIAL_DAYS = 2, PREMIUM_DAYS = 29, DAILY_QUOTA = 13;
 const FREE_WORDS = 3;   // a user whose plan has expired (the "Free" plan) is SHOWN only the first this-many words of a batch, and gets no downloads
 const DUPLICATE_KEY = 11000;  // MongoDB error code for a unique-index clash
 const RETRIES = 10;
@@ -80,22 +82,40 @@ function createDb({ users, histories, dictionary, counters, jobs, articles, paym
   async function createUser(email) {
     const e = norm(email);
     try {
-      await users.insertOne({ email: e, expiry_date: addDays(todayFn(), TRIAL_DAYS + 1), daily_quota: DAILY_QUOTA, last_used: null, ref_pending: true });
+      await users.insertOne({ email: e, expiry_date: todayFn(), daily_quota: DAILY_QUOTA, last_used: null, ref_pending: true, trial_used: false });
     } catch (err) { if (!isDuplicate(err)) throw err; } // two sign-ins at once: keep the first
     const user = await getUser(e);
     await ensureHistory(user._id);
     return user;
   }
 
-  // Gives an existing account PREMIUM_DAYS days counted from today, PLUS the bonus days it has saved up from rewards (they are
-  // used up here: bonus_days goes back to 0 in the same write). Returns null if there is no such account.
+  // Gives an existing account PREMIUM_DAYS days counted from today (30 days counting today), PLUS the bonus days it has saved up from
+  // rewards (they are used up here: bonus_days goes back to 0 in the same write). A plan that already runs longer is never shortened.
+  // Returns null if there is no such account.
   async function grantPremium(email) {
     for (let i = 0; i < RETRIES; i++) {
       const u = await getUser(email);
       if (!u) return null;
       const bonus = u.bonus_days || 0;
-      const r = await users.updateOne({ _id: u._id, bonus_days: u.bonus_days === undefined ? null : u.bonus_days },
-                                      { $set: { expiry_date: addDays(todayFn(), PREMIUM_DAYS + 1 + bonus), bonus_days: 0 } });
+      const until = addDays(todayFn(), PREMIUM_DAYS + 1 + bonus);
+      const r = await users.updateOne({ _id: u._id, bonus_days: u.bonus_days === undefined ? null : u.bonus_days, expiry_date: u.expiry_date },
+                                      { $set: { expiry_date: until > u.expiry_date ? until : u.expiry_date, bonus_days: 0 } });
+      if (r.matchedCount === 1) return getUser(email);
+    }
+    throw new Error("The account is busy. Please try again.");
+  }
+
+  // The paid trial (Rs. 1): TRIAL_DAYS days counted from today (3 days counting today), once per account. Accounts created before the trial
+  // was paid have no trial_used flag and count as having used theirs. The flag flips in the same compare-and-set write as the date, so two
+  // payments at the same moment cannot both count. Returns the updated user, null if there is no such account, false if the trial was used.
+  async function grantTrial(email) {
+    for (let i = 0; i < RETRIES; i++) {
+      const u = await getUser(email);
+      if (!u) return null;
+      if (u.trial_used !== false) return false;
+      const until = addDays(todayFn(), TRIAL_DAYS + 1);
+      const r = await users.updateOne({ _id: u._id, trial_used: false, expiry_date: u.expiry_date },
+                                      { $set: { expiry_date: until > u.expiry_date ? until : u.expiry_date, trial_used: true } });
       if (r.matchedCount === 1) return getUser(email);
     }
     throw new Error("The account is busy. Please try again.");
@@ -307,6 +327,7 @@ function createDb({ users, histories, dictionary, counters, jobs, articles, paym
       expiryDate: user.expiry_date,
       validUntil: addDays(user.expiry_date, -1), // last day the account works
       bonusDays: user.bonus_days || 0,            // days earned with rewards, added to the next Premium plan
+      trialUsed: user.trial_used !== false,       // false only for an account that has not bought its Rs. 1 trial yet (the popup then offers it)
       refPending: user.ref_pending === true,      // a new account that has not used or skipped the referral-code step yet
       active: t < user.expiry_date,
       historyCount
@@ -473,7 +494,7 @@ function createDb({ users, histories, dictionary, counters, jobs, articles, paym
   const undecideReward = (key) => needRewards().updateOne({ key }, { $set: { status: "pending" } });
 
   // ----- premium payments (see premium.js): one document per Razorpay payment link this server created -----
-  // { pid: payment link id (unique), user_id, email, amount (paise), currency, status: "created" | "granted", url, created, expires_at, payment_id?, paid_at?, source? }
+  // { pid: payment link id (unique), user_id, email, plan: "trial" | "premium" (missing = premium), amount (paise), currency, status: "created" | "granted", url, created, expires_at, payment_id?, paid_at?, source? }
   // status "created" -> "granted" is a compare-and-set, so a payment extends the plan exactly once however many webhooks / checks arrive.
   const needPayments = () => { if (!payments) throw new Error("The payments collection is not available."); return payments; };
 
@@ -499,7 +520,7 @@ function createDb({ users, histories, dictionary, counters, jobs, articles, paym
   // Puts a claimed link back to "created" (the grant itself failed), so it can be settled again.
   const releaseCheckout = (pid) => needPayments().updateOne({ pid, status: "granted" }, { $set: { status: "created" } });
 
-  return { ping, recordPagePayment, releasePagePayment, saveCheckout, getCheckout, listCheckouts, claimCheckout, releaseCheckout, getUser, createUser, claimJob, getArticle, putArticle, updateArticleWords, finishJob, failJob, dropJob, getJob, ackJob, grantPremium, getHistory, getHistoryState, getHistoryDetails, addHistory, saveDictionary, getDetails, status, isActive, consume, refund, extendDays, addBonus, getRefCode, findByRefCode, claimReferral, reopenReferral, closeReferral, insertReward, getReward, deleteReward, listRewards, listPendingRewards, decideReward, undecideReward,
+  return { ping, recordPagePayment, releasePagePayment, saveCheckout, getCheckout, listCheckouts, claimCheckout, releaseCheckout, getUser, createUser, claimJob, getArticle, putArticle, updateArticleWords, finishJob, failJob, dropJob, getJob, ackJob, grantPremium, grantTrial, getHistory, getHistoryState, getHistoryDetails, addHistory, saveDictionary, getDetails, status, isActive, consume, refund, extendDays, addBonus, getRefCode, findByRefCode, claimReferral, reopenReferral, closeReferral, insertReward, getReward, deleteReward, listRewards, listPendingRewards, decideReward, undecideReward,
            constants: { TRIAL_DAYS, PREMIUM_DAYS, DAILY_QUOTA, FREE_WORDS }, addDays };
 }
 
