@@ -62,16 +62,18 @@ Never choose: common words (the, is, have, good), names of people/places/organiz
 
 IMPORTANT: in the article text, every word the learner has already studied is wrapped in square brackets, like [stalled]. Never choose a bracketed word or any other form of it. You may still use bracketed words to understand the context. The brackets are not part of the article: never put them in any field of your answer.
 
-For each word give ONE array of exactly 7 items, in this order, keeping every text short:
-1. the word
-2. its part of speech (as used in the article)
-3. what it means in THIS article (max 15 words)
-4. the general, plain-English meaning of the word, as a dictionary would give it, that a learner can understand (max 12 words)
-5. an ORIGINAL example sentence (max 18 words, not copied from the article) using the same meaning and the same word
-6. an array of 2 or 3 common synonyms (single words, lower case)
-7. an array of 1 to 3 common antonyms (single words, lower case); use [] only if the word truly has no antonym
+For each word give ONE JSON object with exactly these keys, keeping every text short:
+- "word": the word
+- "partOfSpeech": its part of speech (as used in the article)
+- "meaningInContext": what it means in THIS article (max 15 words)
+- "simpleMeaning": the general, plain-English meaning of the word, as a dictionary would give it, that a learner can understand (max 12 words)
+- "exampleSentence": an ORIGINAL example sentence (max 18 words, not copied from the article) using the same meaning and the same word
+- "synonyms": an array of 2 or 3 common synonyms (single words, lower case)
+- "antonyms": an array of 1 to 3 common antonyms (single words, lower case); use [] only if the word truly has no antonym
 
-Output format: {"words":[["word","partOfSpeech","meaningInContext","simpleMeaning","exampleSentence",["synonym1","synonym2"],["antonym1"]],...]}
+JSON rules: output valid JSON only. Use plain double quotes for keys and strings; never put a double quote inside a text value (use a single quote instead); no trailing commas.
+
+Output format: {"words":[{"word":"...","partOfSpeech":"...","meaningInContext":"...","simpleMeaning":"...","exampleSentence":"...","synonyms":["..."],"antonyms":["..."]}]}
 
 ARTICLE TITLE: ${title}
 
@@ -79,6 +81,7 @@ ARTICLE TEXT:
 ${text}`;
 }
 
+let jsonModeOk = process.env.NVIDIA_JSON_MODE !== "off"; // asks the server to guarantee valid JSON; switched off for good if the endpoint rejects it
 async function callModel(prompt, model = MODEL) {
   const url = (process.env.NVIDIA_BASE_URL || "https://integrate.api.nvidia.com") + "/v1/chat/completions";
   let res;
@@ -94,6 +97,7 @@ async function callModel(prompt, model = MODEL) {
         top_p: 0.95,
         max_tokens: NVIDIA_MAX_TOKENS,
         stream: false,
+        ...(jsonModeOk ? { response_format: { type: "json_object" } } : {}),
         chat_template_kwargs: { enable_thinking: ENABLE_THINKING }
       })
     });
@@ -105,6 +109,9 @@ async function callModel(prompt, model = MODEL) {
   if (!res.ok) {
     const msg = (data && ((data.error && data.error.message) || data.detail || data.message)) || "HTTP " + res.status;
     const err = new Error(typeof msg === "string" ? msg : JSON.stringify(msg)); err.status = res.status;
+    if (res.status === 400 && jsonModeOk && /response_format|json_object|guided|unsupported/i.test(err.message)) {
+      jsonModeOk = false; console.warn("The model does not accept response_format; JSON mode is switched off."); return callModel(prompt, model);
+    }
     throw err;
   }
   const choice = data.choices && data.choices[0];
@@ -127,6 +134,18 @@ async function callModelWithRetry(prompt, model) {
   }
 }
 
+// Asks the model and parses its answer. If the JSON is broken beyond repair, asks once more (a different sample usually works).
+async function askForWords(prompt, model) {
+  for (let attempt = 0; ; attempt++) {
+    const raw = await callModelWithRetry(prompt, model);
+    try { return normalizeCandidates(parseJsonLoose(raw)); }
+    catch (e) {
+      console.error("[model] unreadable answer (" + e.message + "): " + raw.slice(0, 200).replace(/\s+/g, " "));
+      if (attempt >= 1) { const err = new Error("The AI returned an unreadable answer. Please try again."); err.friendly = true; err.status = 502; throw err; }
+    }
+  }
+}
+
 // `history` is the array of words the learner already knows. In the final text sent to the AI model, the article (cut at
 // MAX_ARTICLE_CHARS) is kept and every history word is wrapped in [ ]. The same cut text is used to validate the AI model's answer.
 // ONE the AI model call only: if fewer than `limit` valid new words come back, the caller gets just those (never a second call).
@@ -138,9 +157,7 @@ async function generateVocabulary({ title, text, limit, history, model }) {
     err.friendly = true; throw err;
   }
   const candidateCount = Math.min(limit + 3, 30); // a few extra, because candidates that fail validation are skipped (less output = faster)
-  const raw = await callModelWithRetry(buildPrompt({ title, text: marked.text, limit, candidateCount }), model);
-  const parsed = parseJsonLoose(raw);
-  const candidates = normalizeCandidates(parsed);
+  const candidates = await askForWords(buildPrompt({ title, text: marked.text, limit, candidateCount }), model);
   // Also rejects any history word (exact or same stem) the model returns anyway.
   const { words } = selectWords(candidates, source, limit, history);
   if (words.length === 0) {
@@ -314,8 +331,8 @@ const noWordsMessage = (history) => history.length > 0
 
 // The one the AI model call for a new article: the whole article (nothing marked), CACHE_CANDIDATES words, checked like any other answer.
 async function fetchCandidates({ title, source }) {
-  const raw = await callModelWithRetry(buildPrompt({ title, text: source, limit: MAX_LIMIT, candidateCount: CACHE_CANDIDATES }));
-  const { words } = selectWords(normalizeCandidates(parseJsonLoose(raw)), source, CACHE_CANDIDATES, []);
+  const candidates = await askForWords(buildPrompt({ title, text: source, limit: MAX_LIMIT, candidateCount: CACHE_CANDIDATES }));
+  const { words } = selectWords(candidates, source, CACHE_CANDIDATES, []);
   if (words.length === 0) throw friendlyError(noWordsMessage([]));
   return words;
 }

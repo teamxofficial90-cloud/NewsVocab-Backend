@@ -91,11 +91,48 @@ function selectWords(candidates, articleText, limit = 10, previousWords = [], op
   return { words: out, rejected };
 }
 
+// Small models sometimes emit almost-valid JSON (a missing comma, a trailing comma, an unescaped quote). Fix the common slips.
+function repairJson(str) {
+  return str
+    .replace(/[\u201C\u201D]/g, '"')                 // curly double quotes used as JSON quotes
+    .replace(/,\s*([}\]])/g, "$1")                    // trailing commas
+    .replace(/(["\]}])\s*\n\s*(["\[{])/g, "$1,$2")   // missing comma between items on separate lines
+    .replace(/\](\s*)\[/g, "],$1[")                  // ][  ->  ],[
+    .replace(/\}(\s*)\{/g, "},$1{");                 // }{  ->  },{
+}
+
+// Last resort: walk the "words" array and keep every element that parses on its own, so one bad row does not lose the other 12.
+function salvageWords(text) {
+  const m = /"words"\s*:\s*\[/.exec(text);
+  if (!m) return null;
+  const words = [];
+  let i = m.index + m[0].length, depth = 0, inStr = false, esc = false, from = -1;
+  for (; i < text.length; i++) {
+    const c = text[i];
+    if (inStr) { if (esc) esc = false; else if (c === "\\") esc = true; else if (c === '"') inStr = false; continue; }
+    if (c === '"') { inStr = true; continue; }
+    if (c === "[" || c === "{") { if (depth === 0) from = i; depth++; continue; }
+    if (c === "]" || c === "}") {
+      depth--;
+      if (depth === 0 && from !== -1) {
+        const piece = text.slice(from, i + 1); from = -1;
+        for (const cand of [piece, repairJson(piece)]) { try { words.push(JSON.parse(cand)); break; } catch (e) { /* try the next form */ } }
+      } else if (depth < 0) break; // end of the words array
+    }
+  }
+  return words.length ? { words } : null;
+}
+
 function parseJsonLoose(text) {
-  const cleaned = String(text).replace(/```json|```/g, "").trim();
+  let cleaned = String(text).replace(/<think>[\s\S]*?<\/think>/g, "").replace(/```json|```/g, "").trim();
   const start = cleaned.indexOf("{"); const end = cleaned.lastIndexOf("}");
-  if (start === -1 || end === -1) throw new Error("Model did not return JSON");
-  return JSON.parse(cleaned.slice(start, end + 1));
+  if (start === -1) throw new Error("Model did not return JSON");
+  const body = cleaned.slice(start, end === -1 ? undefined : end + 1);
+  try { return JSON.parse(body); } catch (e1) { /* fall through to repairs */ }
+  try { return JSON.parse(repairJson(body)); } catch (e2) { /* fall through to salvage */ }
+  const salvaged = salvageWords(body);
+  if (salvaged) return salvaged;
+  throw new Error("Model returned invalid JSON");
 }
 
 // The prompt asks for compact rows: ["word", "partOfSpeech", "meaningInContext", "simpleMeaning", "exampleSentence", [synonyms], [antonyms]]
