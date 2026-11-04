@@ -1,5 +1,5 @@
-// NewsVocab backend: keeps the Gemini API key on the server, never in the extension.
-// Needs the \"mongodb\" npm package (cd backend && npm install). Start with:  GEMINI_API_KEY=... node server.js
+// NewsVocab backend: keeps the NVIDIA API key on the server, never in the extension.
+// Needs the \"mongodb\" npm package (cd backend && npm install). Start with:  NVIDIA_API_KEY=... node server.js
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
@@ -29,27 +29,24 @@ const HOST = process.env.HOST || "127.0.0.1"; // use 0.0.0.0 when deploying (e.g
 let SESSION_SECRET = process.env.SESSION_SECRET;
 if (!SESSION_SECRET) { SESSION_SECRET = crypto.randomBytes(32).toString("hex"); }
 // Accounts, plan expiry, daily quota and word history live in MongoDB (see db.js). Both are created in start().
-let db, auth, gate, premium, rewards; // premium (Razorpay purchase, see premium.js) is created in start() too; gate (the Gemini queue, see gate.js) is created in start() too
+let db, auth, gate, premium, rewards; // premium (Razorpay purchase, see premium.js) is created in start() too; gate (the the AI model queue, see gate.js) is created in start() too
 const ADMIN_KEY = process.env.ADMIN_KEY || ""; // protects POST /admin/premium; endpoint is off when empty
-const MODEL = process.env.GEMINI_MODEL || "gemini-3.8-flash";
-const MAX_ARTICLE_CHARS = 10000; // about 1,600 words; longer articles are cut here (a shorter text is also a faster Gemini call)
+const MODEL = process.env.NVIDIA_MODEL || "nvidia/nemotron-3.5-bolt-e4b";
+const MAX_ARTICLE_CHARS = 10000; // about 1,600 words; longer articles are cut here (a shorter text is also a faster the AI model call)
 const MAX_BODY_BYTES = 400 * 1024;
 const MIN_LIMIT = 1, MAX_LIMIT = 13;
-// Gemini traffic control (see gate.js): at most GEMINI_CONCURRENCY calls run at once, QUEUE_SIZE more wait in line, the rest are turned away.
+// the AI model traffic control (see gate.js): at most NVIDIA_CONCURRENCY calls run at once, QUEUE_SIZE more wait in line, the rest are turned away.
 const envInt = (name, dflt) => { const n = parseInt(process.env[name], 10); return Number.isFinite(n) && n >= 0 ? n : dflt; };
 const QUEUE_FULL_MESSAGE = "Sorry, try again";
-const GEMINI_TIMEOUT_MS = envInt("GEMINI_TIMEOUT_MS", 45000);       // one Gemini call that takes longer than this is cancelled
-const GEMINI_MAX_RETRIES = envInt("GEMINI_MAX_RETRIES", 2);          // extra tries after a 429/500/503 from Gemini
-const GEMINI_RETRY_BASE_MS = envInt("GEMINI_RETRY_BASE_MS", 1500);   // waits 1.5 s, then 3 s (doubling) before the retries
+const NVIDIA_TIMEOUT_MS = envInt("NVIDIA_TIMEOUT_MS", 45000);       // one the AI model call that takes longer than this is cancelled
+const NVIDIA_MAX_RETRIES = envInt("NVIDIA_MAX_RETRIES", 2);          // extra tries after a 429/500/503 from the AI model
+const NVIDIA_RETRY_BASE_MS = envInt("NVIDIA_RETRY_BASE_MS", 1500);   // waits 1.5 s, then 3 s (doubling) before the retries
 const MIN_FRESH_WORDS = 50;      // if fewer unmarked (not yet learned) words than this are in the article, there is nothing new to teach
 
-// Optional speed setting: limits the model's "thinking" before it answers (a word list needs none). The value is a JSON object whose
-// fields depend on the model family, e.g. GEMINI_THINKING_CONFIG={"thinkingBudget":0} or {"thinkingLevel":"low"}. Not set by default.
-let THINKING = null;
-if (process.env.GEMINI_THINKING_CONFIG) {
-  try { THINKING = JSON.parse(process.env.GEMINI_THINKING_CONFIG); }
-  catch (e) { console.error("GEMINI_THINKING_CONFIG is not valid JSON, so it is ignored."); }
-}
+// Nemotron can "think" before answering. A word list needs no thinking, so it is off by default (faster, cheaper).
+// Set NVIDIA_ENABLE_THINKING=1 to turn it on.
+const ENABLE_THINKING = /^(1|true|on|yes)$/i.test(process.env.NVIDIA_ENABLE_THINKING || "");
+const NVIDIA_MAX_TOKENS = envInt("NVIDIA_MAX_TOKENS", 4096);
 
 const SYSTEM = `You are an expert English vocabulary teacher who reads newspaper articles and editorials.
 Return ONLY a JSON object, with no commentary and no markdown fences.`;
@@ -83,53 +80,56 @@ ${text}`;
 }
 
 async function callModel(prompt, model = MODEL) {
-  const url = (process.env.GEMINI_BASE_URL || "https://generativelanguage.googleapis.com") + "/v1beta/models/" + encodeURIComponent(model) + ":generateContent";
+  const url = (process.env.NVIDIA_BASE_URL || "https://integrate.api.nvidia.com") + "/v1/chat/completions";
   let res;
   try {
     res = await fetch(url, {
-    method: "POST",
-    signal: AbortSignal.timeout(GEMINI_TIMEOUT_MS),
-    headers: { "content-type": "application/json", "x-goog-api-key": process.env.GEMINI_API_KEY },
-    body: JSON.stringify({
-      systemInstruction: { parts: [{ text: SYSTEM }] },
-      contents: [{ role: "user", parts: [{ text: prompt }] }],
-      generationConfig: { responseMimeType: "application/json", temperature: 0.3, maxOutputTokens: 8192, ...(THINKING ? { thinkingConfig: THINKING } : {}) }
-    })
+      method: "POST",
+      signal: AbortSignal.timeout(NVIDIA_TIMEOUT_MS),
+      headers: { "content-type": "application/json", "accept": "application/json", "authorization": "Bearer " + process.env.NVIDIA_API_KEY },
+      body: JSON.stringify({
+        model,
+        messages: [{ role: "system", content: SYSTEM }, { role: "user", content: prompt }],
+        temperature: 0.3,
+        top_p: 0.95,
+        max_tokens: NVIDIA_MAX_TOKENS,
+        stream: false,
+        chat_template_kwargs: { enable_thinking: ENABLE_THINKING }
+      })
     });
   } catch (e) {
-    if (e && e.name === "TimeoutError") { const err = new Error("Gemini took too long to answer."); err.status = 504; throw err; }
+    if (e && e.name === "TimeoutError") { const err = new Error("The AI model took too long to answer."); err.status = 504; throw err; }
     throw e;
   }
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    const msg = (data && data.error && data.error.message) || "HTTP " + res.status;
-    const err = new Error(msg); err.status = res.status;
-    // Gemini reports an invalid key as HTTP 400 (API_KEY_INVALID) rather than 401.
-    if (res.status === 400 && /API key|API_KEY/i.test(msg)) err.status = 401;
+    const msg = (data && ((data.error && data.error.message) || data.detail || data.message)) || "HTTP " + res.status;
+    const err = new Error(typeof msg === "string" ? msg : JSON.stringify(msg)); err.status = res.status;
     throw err;
   }
-  const cand = data.candidates && data.candidates[0];
-  const text = ((cand && cand.content && cand.content.parts) || []).map((p) => p.text || "").join("");
-  if (!text) throw new Error("Gemini returned no text" + (cand && cand.finishReason ? " (" + cand.finishReason + ")" : "") + ".");
+  const choice = data.choices && data.choices[0];
+  let text = (choice && choice.message && choice.message.content) || "";
+  text = text.replace(/<think>[\s\S]*?<\/think>/g, "").trim(); // in case the model returns its thinking inline
+  if (!text) throw new Error("The AI model returned no text" + (choice && choice.finish_reason ? " (" + choice.finish_reason + ")" : "") + ".");
   return text;
 }
 
-// callModel, plus a short wait and another try when Gemini says it is busy (429/500/503). The caller still holds its place in the
+// callModel, plus a short wait and another try when the model says it is busy (429/500/503). The caller still holds its place in the
 // gate meanwhile, so retries cannot pile extra load on top of the limit.
 async function callModelWithRetry(prompt, model) {
   for (let attempt = 0; ; attempt++) {
     try { return await callModel(prompt, model); }
     catch (e) {
       const busy = e.status === 429 || e.status === 500 || e.status === 503;
-      if (!busy || attempt >= GEMINI_MAX_RETRIES) throw e;
-      await new Promise((r) => setTimeout(r, GEMINI_RETRY_BASE_MS * 2 ** attempt));
+      if (!busy || attempt >= NVIDIA_MAX_RETRIES) throw e;
+      await new Promise((r) => setTimeout(r, NVIDIA_RETRY_BASE_MS * 2 ** attempt));
     }
   }
 }
 
-// `history` is the array of words the learner already knows. In the final text sent to Gemini, the article (cut at
-// MAX_ARTICLE_CHARS) is kept and every history word is wrapped in [ ]. The same cut text is used to validate Gemini's answer.
-// ONE Gemini call only: if fewer than `limit` valid new words come back, the caller gets just those (never a second call).
+// `history` is the array of words the learner already knows. In the final text sent to the AI model, the article (cut at
+// MAX_ARTICLE_CHARS) is kept and every history word is wrapped in [ ]. The same cut text is used to validate the AI model's answer.
+// ONE the AI model call only: if fewer than `limit` valid new words come back, the caller gets just those (never a second call).
 async function generateVocabulary({ title, text, limit, history, model }) {
   const source = text.slice(0, MAX_ARTICLE_CHARS);
   const marked = markKnownWords(source, buildKnown(history)); // one O(n) pass, O(1) Set lookups
@@ -287,7 +287,7 @@ async function handleVerifyPayment(res, user) {
   } catch (e) { console.error("[verify payment]", e.message); send(res, e.status || 500, { error: e.friendly ? e.message : "Could not check the payment. Please try again." }); }
 }
 
-// The popup can be closed while Gemini is still working (Chrome closes it on any click elsewhere). The server keeps going anyway,
+// The popup can be closed while the AI model is still working (Chrome closes it on any click elsewhere). The server keeps going anyway,
 // so every request is recorded as a "job" (see db.js): whatever happens, the outcome is saved for an hour and the popup can ask for it
 // the next time it opens (GET /api/vocab/last), then confirm it has the words (POST /api/vocab/ack).
 const JOB_ID = /^[A-Za-z0-9_-]{8,64}$/;
@@ -295,16 +295,16 @@ const JOB_ID = /^[A-Za-z0-9_-]{8,64}$/;
 // Does the work of one request and returns { status, body }. The job document says "running" while this runs, and ends as "done"
 // (the words), "failed" (the message) or removed (nothing worth keeping).
 // ----- Article cache -----
-// The first user to read an article makes ONE Gemini call that picks CACHE_CANDIDATES words for the article itself (nothing about any
-// user goes into it). Everybody after that gets the first words from that list that are not in their own history: no Gemini call, an
+// The first user to read an article makes ONE the AI model call that picks CACHE_CANDIDATES words for the article itself (nothing about any
+// user goes into it). Everybody after that gets the first words from that list that are not in their own history: no the AI model call, an
 // instant answer. If a user's history leaves too few, that one user gets a normal per-user call (generateVocabulary), and any new words
 // it finds are added to the list. ARTICLE_CACHE=off turns all of this off.
-const CACHE_CANDIDATES = 30;   // words asked from Gemini for a new article
+const CACHE_CANDIDATES = 30;   // words asked from the AI model for a new article
 const CACHE_MAX_WORDS = 60;    // most words kept per article, after per-user calls have added some
 let cacheOn = false, cacheTtlMs = 0;
 let hotArticles = createRecent(2000);          // hashes cached or being fetched on this server: lets a cached article through a full line
-const pendingArticles = new Map();             // hash -> { promise, leaderKey } while the first request for an article is at Gemini
-const followerOf = new Map();                  // queue key of a request waiting for another request's Gemini call -> that request's queue key
+const pendingArticles = new Map();             // hash -> { promise, leaderKey } while the first request for an article is at the AI model
+const followerOf = new Map();                  // queue key of a request waiting for another request's the AI model call -> that request's queue key
 const cacheStats = { hits: 0, waited: 0, misses: 0, fallbacks: 0 }; // shown by /health
 const cacheLikely = (hash) => pendingArticles.has(hash) || hotArticles.has(hash);
 const friendlyError = (message) => { const e = new Error(message); e.friendly = true; return e; };
@@ -312,7 +312,7 @@ const noWordsMessage = (history) => history.length > 0
   ? "No new words could be found in this article that are not already in your history. Try a different article."
   : "No suitable vocabulary words could be found in this article. Try a different article.";
 
-// The one Gemini call for a new article: the whole article (nothing marked), CACHE_CANDIDATES words, checked like any other answer.
+// The one the AI model call for a new article: the whole article (nothing marked), CACHE_CANDIDATES words, checked like any other answer.
 async function fetchCandidates({ title, source }) {
   const raw = await callModelWithRetry(buildPrompt({ title, text: source, limit: MAX_LIMIT, candidateCount: CACHE_CANDIDATES }));
   const { words } = selectWords(normalizeCandidates(parseJsonLoose(raw)), source, CACHE_CANDIDATES, []);
@@ -320,14 +320,14 @@ async function fetchCandidates({ title, source }) {
   return words;
 }
 
-// The article's candidate words: from the database (hit), from the request that is already asking Gemini (waited), or by asking Gemini
-// now (leader). Concurrent requests for the same new article therefore cost one Gemini call, not one each.
+// The article's candidate words: from the database (hit), from the request that is already asking the AI model (waited), or by asking the AI model
+// now (leader). Concurrent requests for the same new article therefore cost one the AI model call, not one each.
 async function articleWords({ hash, title, source, key }) {
   let pending = pendingArticles.get(hash);
   if (!pending) {
     const cached = await db.getArticle(hash);
     if (cached) { cacheStats.hits++; hotArticles.add(hash); return { role: "hit", entries: cached }; }
-    pending = pendingArticles.get(hash); // a request may have started asking Gemini while we asked the database
+    pending = pendingArticles.get(hash); // a request may have started asking the AI model while we asked the database
   }
   if (pending) {
     cacheStats.waited++;
@@ -346,9 +346,9 @@ async function articleWords({ hash, title, source, key }) {
   finally { pendingArticles.delete(hash); }
 }
 
-// Used by processVocab instead of calling Gemini directly. Returns { words }.
+// Used by processVocab instead of calling the AI model directly. Returns { words }.
 async function generateWithCache({ title, text, limit, history, key }) {
-  if (!cacheOn) return gate.run(() => generateVocabulary({ title, text, limit, history }), key); // one Gemini call per request, as before
+  if (!cacheOn) return gate.run(() => generateVocabulary({ title, text, limit, history }), key); // one the AI model call per request, as before
   const source = text.slice(0, MAX_ARTICLE_CHARS);
   if (markKnownWords(source, buildKnown(history)).fresh < MIN_FRESH_WORDS) {
     throw friendlyError("Almost nothing new is left in this article: nearly every word in it is already in your history. Try a different article.");
@@ -404,7 +404,7 @@ async function processVocab(user, { title, text, limit, jobId }) {
 
   let result;
   try {
-    // Words come from the article cache when possible; any Gemini call waits in the gate's line if Gemini is already busy with
+    // Words come from the article cache when possible; any the AI model call waits in the gate's line if the AI model is already busy with
     // `concurrency` other calls. The popup can ask how long is left (GET /api/vocab/queue) while this request is open.
     result = await generateWithCache({ title: String(title || "").slice(0, 300), text, limit, history, key: queueKey(user, jobId) });
   } catch (e) {
@@ -413,9 +413,9 @@ async function processVocab(user, { title, text, limit, jobId }) {
       await db.dropJob(user._id, jobId).catch(() => {});
       return { status: 503, body: { code: "QUEUE_FULL", error: QUEUE_FULL_MESSAGE } };
     }
-    const msg = e.status === 401 || e.status === 403 ? "Gemini rejected the API key. Check GEMINI_API_KEY in backend/.env."
-      : e.status === 429 ? "Gemini is rate-limited or out of quota right now. Try again in a minute."
-      : e.status === 504 ? "Gemini took too long to answer. Please try again."
+    const msg = e.status === 401 || e.status === 403 ? "NVIDIA rejected the API key. Check NVIDIA_API_KEY in backend/.env."
+      : e.status === 429 ? "the AI model is rate-limited or out of quota right now. Try again in a minute."
+      : e.status === 504 ? "the AI model took too long to answer. Please try again."
       : e.friendly ? e.message
       : "Vocabulary generation failed: " + e.message;
     console.error("[generate]", e.message);
@@ -452,8 +452,8 @@ async function processVocab(user, { title, text, limit, jobId }) {
 }
 
 async function handleVocab(req, res, user) {
-  if (!process.env.GEMINI_API_KEY) {
-    return send(res, 503, { error: "The backend has no GEMINI_API_KEY configured. See the README (setup step 2)." });
+  if (!process.env.NVIDIA_API_KEY) {
+    return send(res, 503, { error: "The backend has no NVIDIA_API_KEY configured. See the README (setup step 2)." });
   }
   const body = await readJson(req, res); if (!body) return;
   const { title, text } = body;
@@ -464,8 +464,8 @@ async function handleVocab(req, res, user) {
     return send(res, 400, { error: "wordLimit must be a whole number from " + MIN_LIMIT + " to " + MAX_LIMIT + "." });
   }
 
-  // The Gemini line is full: turn this request away before any database work (no quota used), unless the article is already cached or
-  // being fetched right now, because then it needs no Gemini call.
+  // The the AI model line is full: turn this request away before any database work (no quota used), unless the article is already cached or
+  // being fetched right now, because then it needs no the AI model call.
   if (gate.isFull() && !(cacheOn && cacheLikely(articleHash(text.slice(0, MAX_ARTICLE_CHARS))))) {
     return send(res, 503, { code: "QUEUE_FULL", error: QUEUE_FULL_MESSAGE });
   }
@@ -502,7 +502,7 @@ function handleQueueStatus(req, res, user) {
   if (!JOB_ID.test(jobId)) return send(res, 200, { state: "none" });
   const key = queueKey(user, jobId);
   let st = gate.status(key);
-  // A request that waits for another request's Gemini call (same article) follows that request's place in line.
+  // A request that waits for another request's the AI model call (same article) follows that request's place in line.
   if (st.state === "none" && followerOf.has(key)) {
     const lead = gate.status(followerOf.get(key));
     if (lead.state !== "none") st = { state: lead.state, position: lead.position, etaSeconds: lead.etaSeconds + 1 };
@@ -539,7 +539,7 @@ async function handlePing(req, res) {
 async function route(req, res) {
   if (req.method === "OPTIONS") return send(res, 204, {});
   if ((req.method === "GET" || req.method === "HEAD") && (req.url === "/ping" || req.url.startsWith("/ping?"))) return handlePing(req, res);
-  if (req.method === "GET" && req.url === "/health") return send(res, 200, { ok: true, aiConfigured: !!process.env.GEMINI_API_KEY, authConfigured: !!process.env.GOOGLE_CLIENT_ID, paymentsConfigured: premium.configured(), paymentMode: premium.pageMode() ? "page" : premium.configured() ? "link" : "off", paymentWebhookConfigured: premium.webhookConfigured(), rewardsEnabled: rewards.config().enabled, model: MODEL, maxWordLimit: MAX_LIMIT, articleCache: { enabled: cacheOn, ...cacheStats }, queue: gate.stats() });
+  if (req.method === "GET" && req.url === "/health") return send(res, 200, { ok: true, aiConfigured: !!process.env.NVIDIA_API_KEY, authConfigured: !!process.env.GOOGLE_CLIENT_ID, paymentsConfigured: premium.configured(), paymentMode: premium.pageMode() ? "page" : premium.configured() ? "link" : "off", paymentWebhookConfigured: premium.webhookConfigured(), rewardsEnabled: rewards.config().enabled, model: MODEL, maxWordLimit: MAX_LIMIT, articleCache: { enabled: cacheOn, ...cacheStats }, queue: gate.stats() });
 
   if (req.method === "POST" && req.url === "/auth/google") return handleGoogleAuth(req, res);
   if (req.method === "POST" && req.url === "/admin/premium") return handleGrantPremium(req, res);
@@ -585,15 +585,15 @@ async function openCollections() {
 async function start(collections, opts = {}) {
   collections = collections || await openCollections();
   db = createDb({ users: collections.users, histories: collections.histories, dictionary: collections.dictionary, counters: collections.counters, jobs: collections.jobs, articles: collections.articles, payments: collections.payments, rewards: collections.rewards, timezone: process.env.QUOTA_TIMEZONE, today: opts.today });
-  cacheOn = process.env.ARTICLE_CACHE !== "off" && !!collections.articles; // ARTICLE_CACHE=off: every request goes to Gemini
+  cacheOn = process.env.ARTICLE_CACHE !== "off" && !!collections.articles; // ARTICLE_CACHE=off: every request goes to the AI model
   cacheTtlMs = (parseFloat(process.env.ARTICLE_CACHE_DAYS) > 0 ? parseFloat(process.env.ARTICLE_CACHE_DAYS) : 2) * 24 * 3600 * 1000;
   lastDbPing = { at: 0, ok: null };
   hotArticles = createRecent(2000); pendingArticles.clear(); followerOf.clear(); Object.keys(cacheStats).forEach((k) => (cacheStats[k] = 0));
   gate = opts.gate || createGate({
-    concurrency: Math.max(1, envInt("GEMINI_CONCURRENCY", 30)),
+    concurrency: Math.max(1, envInt("NVIDIA_CONCURRENCY", envInt("GEMINI_CONCURRENCY", 5))),
     queueSize: envInt("QUEUE_SIZE", 100),
     maxWaitMs: envInt("QUEUE_MAX_WAIT_MS", 90000),
-    initialAvgMs: envInt("GEMINI_EST_SECONDS", 10) * 1000
+    initialAvgMs: envInt("NVIDIA_EST_SECONDS", envInt("GEMINI_EST_SECONDS", 5)) * 1000
   });
   premium = createPremium({ db });
   rewards = createRewards({ db });
@@ -607,7 +607,7 @@ async function start(collections, opts = {}) {
   });
   await new Promise((resolve) => server.listen(PORT, HOST, resolve));
   console.log("NewsVocab backend listening on http://" + (HOST === "127.0.0.1" ? "localhost" : HOST) + ":" + server.address().port + " (model: " + MODEL + ")");
-  if (!process.env.GEMINI_API_KEY) console.warn("WARNING: GEMINI_API_KEY is not set; /api/vocab will return an error until it is.");
+  if (!process.env.NVIDIA_API_KEY) console.warn("WARNING: NVIDIA_API_KEY is not set; /api/vocab will return an error until it is.");
   if (!premium.configured()) console.warn("WARNING: neither RAZORPAY_PAYMENT_PAGE_URL nor RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET is set; the Get Premium button cannot start a payment until one is.");
   else if (premium.pageMode() && !premium.webhookConfigured()) console.warn("WARNING: RAZORPAY_PAYMENT_PAGE_URL is set but RAZORPAY_WEBHOOK_SECRET is not: a payment made on the page can only be confirmed by the webhook, so no plan will be extended until you add it.");
   else if (!premium.webhookConfigured()) console.warn("NOTE: RAZORPAY_WEBHOOK_SECRET is not set; payments are confirmed only when the popup checks (no webhook).");
