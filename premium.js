@@ -28,7 +28,14 @@ const CURRENCY = "INR";
 const LINK_HOURS = 24;            // an unpaid payment link stops working after this long
 const RAZORPAY_TIMEOUT_MS = 15000;
 
-function createPremium({ db, env = process.env, now = Date.now }) {
+// The price (rupees) and length (days) of the plans come from the admin settings (settings.js) when given, else from PLANS above.
+// Read at the moment of use. In payment page mode the amount of each Razorpay payment page must match the price here.
+function createPremium({ db, settings, env = process.env, now = Date.now }) {
+  const plans = () => {
+    const s = settings && settings.get();
+    if (!s) return PLANS;
+    return { trial: { paise: s.trialPrice * 100, days: s.trialDays, label: s.trialDays + "-day trial" }, premium: { paise: s.premiumPrice * 100, days: s.premiumDays, label: "Premium - " + s.premiumDays + " days" } };
+  };
   // Read at call time so the keys can be set (or changed) without code changes.
   const cfg = () => ({
     keyId: env.RAZORPAY_KEY_ID || "",
@@ -86,9 +93,9 @@ function createPremium({ db, env = process.env, now = Date.now }) {
     const t = now();
     const expireBy = Math.floor(t / 1000) + LINK_HOURS * 3600;
     const body = {
-      amount: PLANS[plan].paise, currency: CURRENCY, accept_partial: false,
+      amount: plans()[plan].paise, currency: CURRENCY, accept_partial: false,
       reference_id: "nv_" + crypto.randomBytes(8).toString("hex"),
-      description: "NewsVocab " + (plan === "trial" ? "trial - " + (db.constants.TRIAL_DAYS + 1) : "Premium - " + (db.constants.PREMIUM_DAYS + 1)) + " days",
+      description: "NewsVocab " + (plan === "trial" ? "trial - " + plans().trial.days : "Premium - " + plans().premium.days) + " days",
       customer: { email: user.email },
       notify: { email: false, sms: false }, reminder_enable: false,
       expire_by: expireBy,
@@ -97,7 +104,7 @@ function createPremium({ db, env = process.env, now = Date.now }) {
     if (c.callbackUrl) { body.callback_url = c.callbackUrl; body.callback_method = "get"; }
     const link = await rzp("POST", "/v1/payment_links", body);
     if (!link || !link.id || !link.short_url) throw fail("Razorpay did not return a payment page. Please try again.");
-    await db.saveCheckout({ pid: link.id, user_id: user._id, email: user.email, plan, amount: PLANS[plan].paise, currency: CURRENCY, status: "created", url: link.short_url, created: new Date(t), expires_at: new Date(expireBy * 1000) });
+    await db.saveCheckout({ pid: link.id, user_id: user._id, email: user.email, plan, amount: plans()[plan].paise, currency: CURRENCY, status: "created", url: link.short_url, created: new Date(t), expires_at: new Date(expireBy * 1000) });
     return { url: link.short_url, linkId: link.id, reused: false };
   }
 
@@ -108,7 +115,7 @@ function createPremium({ db, env = process.env, now = Date.now }) {
     const co = await db.getCheckout(linkId);
     if (!co) return { ok: false, reason: "UNKNOWN_LINK" };               // not a link this server created
     if (co.status === "granted") return { ok: true, granted: false };     // already used: a repeated webhook or a second check
-    const plan = planOf(co.plan), price = PLANS[plan].paise; // a link created before the trial existed has no plan: it is a Premium link
+    const plan = planOf(co.plan), price = plans()[plan].paise; // a link created before the trial existed has no plan: it is a Premium link
     if (amountPaid !== price || co.amount !== price) return { ok: false, reason: "AMOUNT" };
     if (currency !== CURRENCY) return { ok: false, reason: "CURRENCY" };
     if (!(await db.claimCheckout(linkId, { payment_id: paymentId || "", paid_at: new Date(now()), source }))) return { ok: true, granted: false }; // another request got there first
@@ -127,7 +134,7 @@ function createPremium({ db, env = process.env, now = Date.now }) {
   async function settlePagePayment(pay, source) {
     if (!pay || !pay.id) return { ok: false, reason: "INCOMPLETE" };
     if (pay.status !== "captured") return { ok: false, reason: "NOT_PAID" };
-    const plan = pay.amount === PLANS.trial.paise ? "trial" : pay.amount === PLANS.premium.paise ? "premium" : null; // the amount decides the plan
+    const P = plans(); const plan = pay.amount === P.trial.paise ? "trial" : pay.amount === P.premium.paise ? "premium" : null; // if both prices are equal, the amount cannot tell them apart and the trial wins // the amount decides the plan
     if (!plan) return { ok: false, reason: "AMOUNT" };
     if (pay.currency !== CURRENCY) return { ok: false, reason: "CURRENCY" };
     const must = cfg().pageMatch; // optional: only payments of this page (text found in the payment's description or notes)
@@ -213,7 +220,7 @@ function createPremium({ db, env = process.env, now = Date.now }) {
     return { granted };
   }
 
-  return { configured, pageMode, webhookConfigured, createCheckout, handleWebhook, verifyForUser, settle, PRICE_PAISE, PLANS };
+  return { configured, pageMode, webhookConfigured, createCheckout, handleWebhook, verifyForUser, settle, PRICE_PAISE, PLANS, plans };
 }
 
 module.exports = { createPremium, PRICE_PAISE, PLANS, CURRENCY };

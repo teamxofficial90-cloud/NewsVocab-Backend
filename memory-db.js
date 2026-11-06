@@ -55,8 +55,9 @@ class MemoryCollection {
     this.docs.push({ ...structuredClone(doc), _id });
     return { insertedId: _id };
   }
-  async updateOne(filter, update) {
-    const d = this.docs.find((x) => matches(x, filter));
+  async updateOne(filter, update, opts = {}) {
+    let d = this.docs.find((x) => matches(x, filter));
+    if (!d && opts.upsert) { d = { ...structuredClone(filter) }; this.docs.push(d); } // upsert: only used by the settings document
     if (!d) return { matchedCount: 0, modifiedCount: 0 };
     if (update.$set) Object.assign(d, structuredClone(update.$set));
     for (const [k, v] of Object.entries(update.$addToSet || {})) {
@@ -76,7 +77,7 @@ class MemoryCollection {
 }
 
 function createMemoryCollections() {
-  return { users: new MemoryCollection(["email"]), histories: new MemoryCollection(["user_id"]), dictionary: new MemoryCollection(["w"]), counters: new MemoryCollection(), jobs: new MemoryCollection(["user_id"]), articles: new MemoryCollection(["h"]), payments: new MemoryCollection(["pid"]), rewards: new MemoryCollection(["key"]), close: async () => {}, drop: async () => {} };
+  return { users: new MemoryCollection(["email"]), histories: new MemoryCollection(["user_id"]), dictionary: new MemoryCollection(["w"]), counters: new MemoryCollection(), jobs: new MemoryCollection(["user_id"]), articles: new MemoryCollection(["h"]), payments: new MemoryCollection(["pid"]), rewards: new MemoryCollection(["key"]), settings: new MemoryCollection(), close: async () => {}, drop: async () => {} };
 }
 
 module.exports = { createMemoryCollections };

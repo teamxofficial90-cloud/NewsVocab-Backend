@@ -54,7 +54,14 @@ function addDays(ymd, n) {
   return new Date(Date.UTC(y, m - 1, d + n)).toISOString().slice(0, 10);
 }
 
-function createDb({ users, histories, dictionary, counters, jobs, articles, payments, rewards, timezone, today, now }) {
+// `settings` (see settings.js) holds the numbers the admin can change; without it the constants above are used. They are read at the moment
+// of use, so a change in the admin applies to the next request without a restart.
+function createDb({ users, histories, dictionary, counters, jobs, articles, payments, rewards, settings, timezone, today, now }) {
+  const live = () => (settings ? settings.get() : null);
+  const dailyQuota = () => { const s = live(); return s ? s.maxWords : DAILY_QUOTA; };       // the daily quota is the largest word count
+  const freeWords = () => { const s = live(); return s ? s.freeWords : FREE_WORDS; };
+  const premiumDays = () => { const s = live(); return s ? s.premiumDays - 1 : PREMIUM_DAYS; }; // stored as "last valid day = today + N"
+  const trialDays = () => { const s = live(); return s ? s.trialDays - 1 : TRIAL_DAYS; };
   const tz = timezone || "Asia/Kolkata";
   const todayFn = today || (() => dateInZone(tz)); // tests can pass a fake clock
   const nowMs = now || (() => Date.now());          // the same for the job timestamps
@@ -82,7 +89,7 @@ function createDb({ users, histories, dictionary, counters, jobs, articles, paym
   async function createUser(email) {
     const e = norm(email);
     try {
-      await users.insertOne({ email: e, expiry_date: todayFn(), daily_quota: DAILY_QUOTA, last_used: null, ref_pending: true, trial_used: false });
+      await users.insertOne({ email: e, expiry_date: todayFn(), daily_quota: dailyQuota(), last_used: null, ref_pending: true, trial_used: false });
     } catch (err) { if (!isDuplicate(err)) throw err; } // two sign-ins at once: keep the first
     const user = await getUser(e);
     await ensureHistory(user._id);
@@ -97,7 +104,7 @@ function createDb({ users, histories, dictionary, counters, jobs, articles, paym
       const u = await getUser(email);
       if (!u) return null;
       const bonus = u.bonus_days || 0;
-      const until = addDays(todayFn(), PREMIUM_DAYS + 1 + bonus);
+      const until = addDays(todayFn(), premiumDays() + 1 + bonus);
       const r = await users.updateOne({ _id: u._id, bonus_days: u.bonus_days === undefined ? null : u.bonus_days, expiry_date: u.expiry_date },
                                       { $set: { expiry_date: until > u.expiry_date ? until : u.expiry_date, bonus_days: 0 } });
       if (r.matchedCount === 1) return getUser(email);
@@ -113,7 +120,7 @@ function createDb({ users, histories, dictionary, counters, jobs, articles, paym
       const u = await getUser(email);
       if (!u) return null;
       if (u.trial_used !== false) return false;
-      const until = addDays(todayFn(), TRIAL_DAYS + 1);
+      const until = addDays(todayFn(), trialDays() + 1);
       const r = await users.updateOne({ _id: u._id, trial_used: false, expiry_date: u.expiry_date },
                                       { $set: { expiry_date: until > u.expiry_date ? until : u.expiry_date, trial_used: true } });
       if (r.matchedCount === 1) return getUser(email);
@@ -321,9 +328,9 @@ function createDb({ users, histories, dictionary, counters, jobs, articles, paym
       if (h) await histories.updateOne({ user_id: user._id }, { $set: { word_count: historyCount } }).catch(() => {});
     }
     return {
-      dailyQuota: DAILY_QUOTA,
-      freeWords: FREE_WORDS,
-      remainingToday: user.last_used === t ? user.daily_quota : DAILY_QUOTA,
+      dailyQuota: dailyQuota(),
+      freeWords: freeWords(),
+      remainingToday: user.last_used === t ? Math.min(user.daily_quota, dailyQuota()) : dailyQuota(),
       expiryDate: user.expiry_date,
       validUntil: addDays(user.expiry_date, -1), // last day the account works
       bonusDays: user.bonus_days || 0,            // days earned with rewards, added to the next Premium plan
@@ -343,7 +350,7 @@ function createDb({ users, histories, dictionary, counters, jobs, articles, paym
       const u = await getUser(email);
       if (!u) return { ok: false, reason: "NO_ACCOUNT" };
       if (!allowExpired && !(t < u.expiry_date)) return { ok: false, reason: "EXPIRED", expiryDate: u.expiry_date };
-      const available = u.last_used === t ? u.daily_quota : DAILY_QUOTA; // new day: starts again at 13
+      const available = u.last_used === t ? Math.min(u.daily_quota, dailyQuota()) : dailyQuota(); // new day: starts again at the full quota (13 by default); a lowered quota applies at once
       if (words > available) return { ok: false, reason: "QUOTA", remaining: available };
       const r = await users.updateOne({ _id: u._id, daily_quota: u.daily_quota, last_used: u.last_used },
                                       { $set: { daily_quota: available - words, last_used: t } });
@@ -358,7 +365,7 @@ function createDb({ users, histories, dictionary, counters, jobs, articles, paym
       const u = await getUser(email);
       if (!u || u.last_used !== todayFn()) return;
       const r = await users.updateOne({ _id: u._id, daily_quota: u.daily_quota, last_used: u.last_used },
-                                      { $set: { daily_quota: Math.min(DAILY_QUOTA, u.daily_quota + words) } });
+                                      { $set: { daily_quota: Math.min(dailyQuota(), u.daily_quota + words) } });
       if (r.matchedCount === 1) return;
     }
   }
@@ -521,7 +528,8 @@ function createDb({ users, histories, dictionary, counters, jobs, articles, paym
   const releaseCheckout = (pid) => needPayments().updateOne({ pid, status: "granted" }, { $set: { status: "created" } });
 
   return { ping, recordPagePayment, releasePagePayment, saveCheckout, getCheckout, listCheckouts, claimCheckout, releaseCheckout, getUser, createUser, claimJob, getArticle, putArticle, updateArticleWords, finishJob, failJob, dropJob, getJob, ackJob, grantPremium, grantTrial, getHistory, getHistoryState, getHistoryDetails, addHistory, saveDictionary, getDetails, status, isActive, consume, refund, extendDays, addBonus, getRefCode, findByRefCode, claimReferral, reopenReferral, closeReferral, insertReward, getReward, deleteReward, listRewards, listPendingRewards, decideReward, undecideReward,
-           constants: { TRIAL_DAYS, PREMIUM_DAYS, DAILY_QUOTA, FREE_WORDS }, addDays };
+           // live values (getters), so a settings change shows here too
+           constants: { get TRIAL_DAYS() { return trialDays(); }, get PREMIUM_DAYS() { return premiumDays(); }, get DAILY_QUOTA() { return dailyQuota(); }, get FREE_WORDS() { return freeWords(); } }, addDays };
 }
 
 module.exports = { createDb, TRIAL_DAYS, PREMIUM_DAYS, DAILY_QUOTA, FREE_WORDS, dateInZone, addDays };

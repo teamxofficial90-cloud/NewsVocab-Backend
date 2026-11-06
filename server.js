@@ -12,6 +12,7 @@ const { articleHash, createRecent, mergeWords } = require("./article-key");
 const { createGate } = require("./gate");
 const { createPremium } = require("./premium");
 const { createRewards } = require("./rewards");
+const { createSettings } = require("./settings");
 
 // Minimal .env loader (optional)
 try {
@@ -29,12 +30,14 @@ const HOST = process.env.HOST || "127.0.0.1"; // use 0.0.0.0 when deploying (e.g
 let SESSION_SECRET = process.env.SESSION_SECRET;
 if (!SESSION_SECRET) { SESSION_SECRET = crypto.randomBytes(32).toString("hex"); }
 // Accounts, plan expiry, daily quota and word history live in MongoDB (see db.js). Both are created in start().
-let db, auth, gate, premium, rewards; // premium (Razorpay purchase, see premium.js) is created in start() too; gate (the the AI model queue, see gate.js) is created in start() too
+let db, auth, gate, premium, rewards, settings; // settings (settings.js): the numbers and texts the admin page edits, created in start() too
+// premium (Razorpay purchase, see premium.js) is created in start() too; gate (the the AI model queue, see gate.js) is created in start() too
 const ADMIN_KEY = process.env.ADMIN_KEY || ""; // protects POST /admin/premium; endpoint is off when empty
 const MODEL = process.env.NVIDIA_MODEL || "nvidia/nemotron-3.5-bolt-e4b";
 const MAX_ARTICLE_CHARS = 10000; // about 1,600 words; longer articles are cut here (a shorter text is also a faster the AI model call)
 const MAX_BODY_BYTES = 400 * 1024;
-const MIN_LIMIT = 1, MAX_LIMIT = 13;
+// The word-count range comes from the admin settings (settings.js; 1 to 13, starting at 10, unless changed there). Read at the moment of use.
+const minLimit = () => settings.get().minWords, maxLimit = () => settings.get().maxWords;
 // the AI model traffic control (see gate.js): at most NVIDIA_CONCURRENCY calls run at once, QUEUE_SIZE more wait in line, the rest are turned away.
 const envInt = (name, dflt) => { const n = parseInt(process.env[name], 10); return Number.isFinite(n) && n >= 0 ? n : dflt; };
 const QUEUE_FULL_MESSAGE = "Sorry, try again";
@@ -331,7 +334,7 @@ const noWordsMessage = (history) => history.length > 0
 
 // The one the AI model call for a new article: the whole article (nothing marked), CACHE_CANDIDATES words, checked like any other answer.
 async function fetchCandidates({ title, source }) {
-  const candidates = await askForWords(buildPrompt({ title, text: source, limit: MAX_LIMIT, candidateCount: CACHE_CANDIDATES }));
+  const candidates = await askForWords(buildPrompt({ title, text: source, limit: maxLimit(), candidateCount: CACHE_CANDIDATES }));
   const { words } = selectWords(candidates, source, CACHE_CANDIDATES, []);
   if (words.length === 0) throw friendlyError(noWordsMessage([]));
   return words;
@@ -476,9 +479,9 @@ async function handleVocab(req, res, user) {
   const { title, text } = body;
   if (typeof text !== "string" || text.trim().split(/\s+/).length < 100) return send(res, 400, { error: "Article text is missing or too short." });
 
-  const limit = body.wordLimit === undefined ? 10 : body.wordLimit;
-  if (!Number.isInteger(limit) || limit < MIN_LIMIT || limit > MAX_LIMIT) {
-    return send(res, 400, { error: "wordLimit must be a whole number from " + MIN_LIMIT + " to " + MAX_LIMIT + "." });
+  const limit = body.wordLimit === undefined ? settings.get().defaultWords : body.wordLimit;
+  if (!Number.isInteger(limit) || limit < minLimit() || limit > maxLimit()) {
+    return send(res, 400, { error: "wordLimit must be a whole number from " + minLimit() + " to " + maxLimit() + "." });
   }
 
   // The the AI model line is full: turn this request away before any database work (no quota used), unless the article is already cached or
@@ -533,6 +536,26 @@ async function handleAck(req, res, user) {
   send(res, 200, { ok: true, removed: done });
 }
 
+// ----- Admin-editable settings (settings.js) -----
+// GET  /config           public (no login, no secrets): what the popup needs. Cached for 30 s by browsers and proxies.
+// GET  /admin/settings   { settings, defaults, updated }          (x-admin-key)
+// POST /admin/settings   { settings } -> { settings, updated }, or 400 { error, errors: { field: message } }   (x-admin-key)
+async function handleConfig(res) {
+  await settings.refresh().catch(() => {}); // a fresh read: the popup must not show prices that are older than the server's own
+  res.writeHead(200, { "content-type": "application/json; charset=utf-8", "access-control-allow-origin": "*", "cache-control": "public, max-age=30" });
+  res.end(JSON.stringify({ settings: settings.get() }));
+}
+async function handleAdminSettings(req, res) {
+  if (!adminOk(req, res)) return;
+  if (req.method === "GET") return send(res, 200, await settings.view());
+  const body = await readJson(req, res); if (!body) return;
+  try {
+    const r = await settings.save(body.settings);
+    if (!r.ok) return send(res, 400, { error: "Some values are not valid.", errors: r.errors });
+    send(res, 200, { settings: r.settings, updated: r.updated });
+  } catch (e) { console.error("[settings]", e.message); send(res, e.status || 500, { error: e.status ? e.message : "Could not save the settings. Please try again." }); }
+}
+
 // Keep-alive for an uptime monitor (UptimeRobot, cron-job.org): GET or HEAD /ping. The reply is tiny and carries no settings.
 // It also reads the database at most once every 6 hours, so an idle Atlas free cluster keeps seeing a connection.
 const DB_PING_EVERY_MS = 6 * 60 * 60 * 1000;
@@ -556,8 +579,10 @@ async function handlePing(req, res) {
 async function route(req, res) {
   if (req.method === "OPTIONS") return send(res, 204, {});
   if ((req.method === "GET" || req.method === "HEAD") && (req.url === "/ping" || req.url.startsWith("/ping?"))) return handlePing(req, res);
-  if (req.method === "GET" && req.url === "/health") return send(res, 200, { ok: true, aiConfigured: !!process.env.NVIDIA_API_KEY, authConfigured: !!process.env.GOOGLE_CLIENT_ID, paymentsConfigured: premium.configured(), paymentMode: premium.pageMode() ? "page" : premium.configured() ? "link" : "off", paymentWebhookConfigured: premium.webhookConfigured(), rewardsEnabled: rewards.config().enabled, model: MODEL, maxWordLimit: MAX_LIMIT, articleCache: { enabled: cacheOn, ...cacheStats }, queue: gate.stats() });
+  if (req.method === "GET" && req.url === "/health") return send(res, 200, { ok: true, aiConfigured: !!process.env.NVIDIA_API_KEY, authConfigured: !!process.env.GOOGLE_CLIENT_ID, paymentsConfigured: premium.configured(), paymentMode: premium.pageMode() ? "page" : premium.configured() ? "link" : "off", paymentWebhookConfigured: premium.webhookConfigured(), rewardsEnabled: rewards.config().enabled, model: MODEL, maxWordLimit: maxLimit(), articleCache: { enabled: cacheOn, ...cacheStats }, queue: gate.stats() });
 
+  if (req.method === "GET" && (req.url === "/config" || req.url.startsWith("/config?"))) return handleConfig(res);
+  if ((req.method === "GET" || req.method === "POST") && req.url === "/admin/settings") return handleAdminSettings(req, res);
   if (req.method === "POST" && req.url === "/auth/google") return handleGoogleAuth(req, res);
   if (req.method === "POST" && req.url === "/admin/premium") return handleGrantPremium(req, res);
   if ((req.method === "POST" && req.url === "/admin/rewards/decide") || (req.method === "GET" && req.url === "/admin/rewards/pending")) return handleAdminRewards(req, res);
@@ -601,7 +626,9 @@ async function openCollections() {
 // `collections` ({ users, histories, dictionary, counters, jobs }) and `opts.today` can be injected by tests.
 async function start(collections, opts = {}) {
   collections = collections || await openCollections();
-  db = createDb({ users: collections.users, histories: collections.histories, dictionary: collections.dictionary, counters: collections.counters, jobs: collections.jobs, articles: collections.articles, payments: collections.payments, rewards: collections.rewards, timezone: process.env.QUOTA_TIMEZONE, today: opts.today });
+  settings = createSettings({ collection: collections.settings }); // before createDb: db reads the quota, plan lengths and Free words from it
+  await settings.refresh();
+  db = createDb({ users: collections.users, histories: collections.histories, dictionary: collections.dictionary, counters: collections.counters, jobs: collections.jobs, articles: collections.articles, payments: collections.payments, rewards: collections.rewards, settings, timezone: process.env.QUOTA_TIMEZONE, today: opts.today });
   cacheOn = process.env.ARTICLE_CACHE !== "off" && !!collections.articles; // ARTICLE_CACHE=off: every request goes to the AI model
   cacheTtlMs = (parseFloat(process.env.ARTICLE_CACHE_DAYS) > 0 ? parseFloat(process.env.ARTICLE_CACHE_DAYS) : 2) * 24 * 3600 * 1000;
   lastDbPing = { at: 0, ok: null };
@@ -612,7 +639,7 @@ async function start(collections, opts = {}) {
     maxWaitMs: envInt("QUEUE_MAX_WAIT_MS", 90000),
     initialAvgMs: envInt("NVIDIA_EST_SECONDS", envInt("GEMINI_EST_SECONDS", 5)) * 1000
   });
-  premium = createPremium({ db });
+  premium = createPremium({ db, settings });
   rewards = createRewards({ db });
   auth = createAuth({ clientId: process.env.GOOGLE_CLIENT_ID, secret: SESSION_SECRET, tokeninfoUrl: process.env.GOOGLE_TOKENINFO_URL, db });
 
