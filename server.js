@@ -37,7 +37,7 @@ const MODEL = process.env.NVIDIA_MODEL || "nvidia/nemotron-3.5-bolt-e4b";
 const MAX_ARTICLE_CHARS = 10000; // about 1,600 words; longer articles are cut here (a shorter text is also a faster the AI model call)
 const MAX_BODY_BYTES = 400 * 1024;
 // The word-count range comes from the admin settings (settings.js; 1 to 13, starting at 10, unless changed there). Read at the moment of use.
-const minLimit = () => settings.get().minWords, maxLimit = () => settings.get().maxWords;
+const minLimit = () => settings.get().wordLimit.min, maxLimit = () => settings.get().wordLimit.max;
 // the AI model traffic control (see gate.js): at most NVIDIA_CONCURRENCY calls run at once, QUEUE_SIZE more wait in line, the rest are turned away.
 const envInt = (name, dflt) => { const n = parseInt(process.env[name], 10); return Number.isFinite(n) && n >= 0 ? n : dflt; };
 const QUEUE_FULL_MESSAGE = "Sorry, try again";
@@ -479,7 +479,7 @@ async function handleVocab(req, res, user) {
   const { title, text } = body;
   if (typeof text !== "string" || text.trim().split(/\s+/).length < 100) return send(res, 400, { error: "Article text is missing or too short." });
 
-  const limit = body.wordLimit === undefined ? settings.get().defaultWords : body.wordLimit;
+  const limit = body.wordLimit === undefined ? settings.get().wordLimit.default : body.wordLimit;
   if (!Number.isInteger(limit) || limit < minLimit() || limit > maxLimit()) {
     return send(res, 400, { error: "wordLimit must be a whole number from " + minLimit() + " to " + maxLimit() + "." });
   }
@@ -551,7 +551,10 @@ async function handleAdminSettings(req, res) {
   const body = await readJson(req, res); if (!body) return;
   try {
     const r = await settings.save(body.settings);
-    if (!r.ok) return send(res, 400, { error: "Some values are not valid.", errors: r.errors });
+    if (!r.ok) { // errors as a list [{ field, message }], the form the admin page shows next to each field
+      const list = Object.entries(r.errors).map(([field, message]) => ({ field, message }));
+      return send(res, 400, { error: list[0].message + (list.length > 1 ? " (" + (list.length - 1) + " more to fix.)" : ""), errors: list });
+    }
     send(res, 200, { settings: r.settings, updated: r.updated });
   } catch (e) { console.error("[settings]", e.message); send(res, e.status || 500, { error: e.status ? e.message : "Could not save the settings. Please try again." }); }
 }

@@ -21,24 +21,27 @@ const mockRazorpay = http.createServer((req, res) => {
   });
 });
 
+const std = () => require("./settings").fresh();
 const check = (name) => console.log("ok -", name);
 
 (async () => {
   // ----- 1. validate() on its own -----
-  let v = validate({}); assert(v.ok); assert.deepStrictEqual(v.settings, { ...DEFAULTS, texts: {} }); check("an empty object gives the standard values");
-  v = validate({ maxWords: "20", texts: { freeNote: "  Hello  ", trialText: "   ", bogus: "x" }, unknown: 5 });
-  assert(v.ok); assert.strictEqual(v.settings.maxWords, 20); assert.deepStrictEqual(v.settings.texts, { freeNote: "Hello" }); assert(!("unknown" in v.settings));
+  let v = validate({}); assert(v.ok); assert.deepStrictEqual(v.settings, std()); check("an empty object gives the standard values");
+  v = validate({ wordLimit: { max: "20" }, plans: { premium: { price: "19.5" } }, texts: { tagline: "  Hello  ", trialInfo: "   ", bogus: "x" }, unknown: 5 });
+  assert(v.ok); assert.strictEqual(v.settings.wordLimit.max, 20); assert.strictEqual(v.settings.plans.premium.price, 19.5);
+  assert.deepStrictEqual(v.settings.texts, { tagline: "Hello" }); assert(!("unknown" in v.settings));
   check("numbers sent as text are accepted; blank texts and unknown keys are dropped");
   const bad = [
-    [{ minWords: 0 }, "minWords"], [{ minWords: 1.5 }, "minWords"], [{ minWords: "abc" }, "minWords"], [{ maxWords: 31 }, "maxWords"],
-    [{ minWords: 5, maxWords: 4 }, "maxWords"], [{ defaultWords: 0 }, "defaultWords"], [{ defaultWords: 14 }, "defaultWords"], [{ minWords: 5, defaultWords: 3 }, "defaultWords"],
-    [{ freeWords: -1 }, "freeWords"], [{ maxWords: 5, defaultWords: 5, freeWords: 6 }, "freeWords"], [{ trialPrice: 0 }, "trialPrice"], [{ premiumPrice: 100001 }, "premiumPrice"],
-    [{ trialDays: 0 }, "trialDays"], [{ premiumDays: 366 }, "premiumDays"], [{ texts: { freeNote: "x".repeat(301) } }, "texts.freeNote"], [{ texts: { freeNote: 5 } }, "texts.freeNote"],
-    [{ texts: [] }, "texts"]
+    [{ wordLimit: { min: 0 } }, "wordLimit.min"], [{ wordLimit: { min: 1.5 } }, "wordLimit.min"], [{ wordLimit: { min: "abc" } }, "wordLimit.min"], [{ wordLimit: { max: 31 } }, "wordLimit.max"],
+    [{ wordLimit: { min: 5, max: 4 } }, "wordLimit.max"], [{ wordLimit: { default: 0 } }, "wordLimit.default"], [{ wordLimit: { default: 14 } }, "wordLimit.default"], [{ wordLimit: { min: 5, default: 3 } }, "wordLimit.default"],
+    [{ freeWords: -1 }, "freeWords"], [{ wordLimit: { max: 5, default: 5 }, freeWords: 6 }, "freeWords"], [{ plans: { trial: { price: 0 } } }, "plans.trial.price"], [{ plans: { premium: { price: 100001 } } }, "plans.premium.price"],
+    [{ plans: { premium: { price: 1.234 } } }, "plans.premium.price"], [{ plans: { trial: { days: 0 } } }, "plans.trial.days"], [{ plans: { premium: { days: 3651 } } }, "plans.premium.days"], [{ plans: { trial: 5 } }, "plans.trial"], [{ wordLimit: 5 }, "wordLimit"],
+    [{ texts: { tagline: "x".repeat(301) } }, "texts.tagline"], [{ texts: { tagline: 5 } }, "texts.tagline"], [{ texts: { tagline: "Hi {nope}" } }, "texts.tagline"], [{ texts: [] }, "texts"]
   ];
   for (const [input, field] of bad) { const r = validate(input); assert(!r.ok && r.errors[field], JSON.stringify(input) + " should fail on " + field + ": " + JSON.stringify(r)); }
   assert(!validate(null).ok && !validate([]).ok && !validate("x").ok);
   check(bad.length + " kinds of bad value are refused with the field named");
+  assert(validate({ texts: { trialButton: "Start {trialDays}-day trial for Rs. {trialPrice}" } }).ok); check("known {placeholders} are allowed in texts");
 
   // ----- 2. through the server -----
   await new Promise((r) => mockGoogle.listen(0, "127.0.0.1", r)); await new Promise((r) => mockRazorpay.listen(0, "127.0.0.1", r));
@@ -60,7 +63,7 @@ const check = (name) => console.log("ok -", name);
   try {
     // public config
     let r = await call("GET", "/config");
-    assert.strictEqual(r.status, 200); assert.deepStrictEqual(r.body.settings, { ...DEFAULTS, texts: {} }); assert(/max-age/.test(r.headers.get("cache-control")));
+    assert.strictEqual(r.status, 200); assert.deepStrictEqual(r.body.settings, std()); assert(/max-age/.test(r.headers.get("cache-control")));
     assert(!JSON.stringify(r.body).includes("adm1n")); check("GET /config is public and returns the standard values");
 
     // admin access
@@ -69,14 +72,14 @@ const check = (name) => console.log("ok -", name);
     assert.strictEqual((await call("POST", "/admin/settings", { settings: {} })).status, 401);
     check("/admin/settings needs the admin key");
     r = await call("GET", "/admin/settings", undefined, ADMIN);
-    assert.strictEqual(r.status, 200); assert.deepStrictEqual(r.body.settings, { ...DEFAULTS, texts: {} }); assert.strictEqual(r.body.updated, null);
-    assert.strictEqual(r.body.defaults.premiumPrice, 14); assert(r.body.defaults.texts.premiumButton);
+    assert.strictEqual(r.status, 200); assert.deepStrictEqual(r.body.settings, std()); assert.strictEqual(r.body.updated, null);
+    assert.strictEqual(r.body.defaults.plans.premium.price, 14); assert(r.body.defaults.texts.premiumInfo);
     check("GET /admin/settings returns { settings, defaults, updated }");
 
     // refused saves change nothing
-    r = await call("POST", "/admin/settings", { settings: { minWords: 8, maxWords: 4 } }, ADMIN);
-    assert.strictEqual(r.status, 400); assert(r.body.errors.maxWords); assert.strictEqual(cols.settings.docs.length, 0);
-    r = await call("POST", "/admin/settings", {}, ADMIN); assert.strictEqual(r.status, 400); assert(r.body.errors.settings);
+    r = await call("POST", "/admin/settings", { settings: { wordLimit: { min: 8, max: 4 } } }, ADMIN);
+    assert.strictEqual(r.status, 400); assert(r.body.errors.some((e) => e.field === "wordLimit.max" && e.message)); assert.strictEqual(cols.settings.docs.length, 0);
+    r = await call("POST", "/admin/settings", {}, ADMIN); assert.strictEqual(r.status, 400); assert(r.body.errors.some((e) => e.field === "settings"));
     check("a bad save is a 400 with the field errors and stores nothing");
 
     // before the change
@@ -87,11 +90,11 @@ const check = (name) => console.log("ok -", name);
     assert.strictEqual(r.status, 400); assert(/from 1 to 13/.test(r.body.error));
 
     // a real save
-    const mine = { minWords: 2, maxWords: 8, defaultWords: 5, freeWords: 2, trialPrice: 3, trialDays: 5, premiumPrice: 29, premiumDays: 60, texts: { premiumButton: "Go Premium", trialText: "" } };
+    const mine = { wordLimit: { min: 2, max: 8, default: 5 }, freeWords: 2, plans: { trial: { price: 3, days: 5 }, premium: { price: 29, days: 60 } }, texts: { premiumButton: "Go Premium", trialInfo: "" } };
     r = await call("POST", "/admin/settings", { settings: mine }, ADMIN);
     assert.strictEqual(r.status, 200); assert.deepStrictEqual(r.body.settings, { ...mine, texts: { premiumButton: "Go Premium" } }); assert(r.body.updated);
     assert.strictEqual(cols.settings.docs.length, 1);
-    r = await call("GET", "/config"); assert.strictEqual(r.body.settings.maxWords, 8); assert.strictEqual(r.body.settings.texts.premiumButton, "Go Premium");
+    r = await call("GET", "/config"); assert.strictEqual(r.body.settings.wordLimit.max, 8); assert.strictEqual(r.body.settings.texts.premiumButton, "Go Premium");
     assert.strictEqual((await call("GET", "/admin/settings", undefined, ADMIN)).body.updated, cols.settings.docs[0].updated);
     check("a good save is stored and shown by /config and /admin/settings");
 
@@ -125,19 +128,28 @@ const check = (name) => console.log("ok -", name);
 
     // survives a restart (same database), and a bad stored document falls back to the standard values
     await new Promise((res) => server.close(res)); server = await start(cols, { today: () => today }); base = "http://127.0.0.1:" + server.address().port;
-    r = await call("GET", "/config"); assert.strictEqual(r.body.settings.premiumPrice, 29); assert.strictEqual(r.body.settings.maxWords, 8);
+    r = await call("GET", "/config"); assert.strictEqual(r.body.settings.plans.premium.price, 29); assert.strictEqual(r.body.settings.wordLimit.max, 8);
     check("the settings survive a restart");
-    cols.settings.docs[0].settings.maxWords = 999; // edited by hand in the database
+    cols.settings.docs[0].settings.wordLimit.max = 999; // edited by hand in the database
     await new Promise((res) => server.close(res)); server = await start(cols, { today: () => today }); base = "http://127.0.0.1:" + server.address().port;
-    r = await call("GET", "/config"); assert.deepStrictEqual(r.body.settings, { ...DEFAULTS, texts: {} });
+    r = await call("GET", "/config"); assert.deepStrictEqual(r.body.settings, std());
     check("an invalid stored document is ignored: the standard values are used");
 
     // a server without a settings collection still works with the standard values, and refuses to save
     await new Promise((res) => server.close(res)); const noSettings = createMemoryCollections(); delete noSettings.settings;
     server = await start(noSettings, { today: () => today }); base = "http://127.0.0.1:" + server.address().port;
-    r = await call("GET", "/config"); assert.strictEqual(r.body.settings.maxWords, 13);
+    r = await call("GET", "/config"); assert.strictEqual(r.body.settings.wordLimit.max, 13);
     r = await call("POST", "/admin/settings", { settings: {} }, ADMIN); assert.strictEqual(r.status, 503);
     check("without a settings collection: standard values, and saving is refused (503)");
+    // the extension's own sanitize() accepts exactly what /config returns (if the extension folder is next to this one)
+    try {
+      const fs = require("fs"), path = require("path"); const f = path.join(__dirname, "..", "extension", "settings.js");
+      if (fs.existsSync(f)) {
+        global.window = {}; global.chrome = { storage: { local: { get: async () => ({}), set: async () => {} } } }; new Function(fs.readFileSync(f, "utf8"))();
+        const S = global.window.NewsVocabSettings; const cfg = (await call("GET", "/config")).body.settings;
+        assert.deepStrictEqual(S.sanitize(cfg), { ...cfg, texts: { ...S.DEFAULTS.texts, ...cfg.texts } }); check("the extension's settings.js reads /config without changing a value");
+      }
+    } catch (e) { if (e.code === "ERR_ASSERTION") throw e; }
     console.log("\nAll settings tests passed.");
   } finally { await new Promise((res) => server.close(res)); mockGoogle.close(); mockRazorpay.close(); }
 })().catch((e) => { console.error("FAILED:", e); process.exit(1); });

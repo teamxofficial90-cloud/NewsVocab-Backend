@@ -58,10 +58,10 @@ function addDays(ymd, n) {
 // of use, so a change in the admin applies to the next request without a restart.
 function createDb({ users, histories, dictionary, counters, jobs, articles, payments, rewards, settings, timezone, today, now }) {
   const live = () => (settings ? settings.get() : null);
-  const dailyQuota = () => { const s = live(); return s ? s.maxWords : DAILY_QUOTA; };       // the daily quota is the largest word count
+  const dailyQuota = () => { const s = live(); return s ? s.wordLimit.max : DAILY_QUOTA; };       // the daily quota is the largest word count
   const freeWords = () => { const s = live(); return s ? s.freeWords : FREE_WORDS; };
-  const premiumDays = () => { const s = live(); return s ? s.premiumDays - 1 : PREMIUM_DAYS; }; // stored as "last valid day = today + N"
-  const trialDays = () => { const s = live(); return s ? s.trialDays - 1 : TRIAL_DAYS; };
+  const premiumDays = () => { const s = live(); return s ? s.plans.premium.days - 1 : PREMIUM_DAYS; }; // stored as "last valid day = today + N"
+  const trialDays = () => { const s = live(); return s ? s.plans.trial.days - 1 : TRIAL_DAYS; };
   const tz = timezone || "Asia/Kolkata";
   const todayFn = today || (() => dateInZone(tz)); // tests can pass a fake clock
   const nowMs = now || (() => Date.now());          // the same for the job timestamps

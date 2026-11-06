@@ -34,7 +34,7 @@ function createPremium({ db, settings, env = process.env, now = Date.now }) {
   const plans = () => {
     const s = settings && settings.get();
     if (!s) return PLANS;
-    return { trial: { paise: s.trialPrice * 100, days: s.trialDays, label: s.trialDays + "-day trial" }, premium: { paise: s.premiumPrice * 100, days: s.premiumDays, label: "Premium - " + s.premiumDays + " days" } };
+    return { trial: { paise: Math.round(s.plans.trial.price * 100), days: s.plans.trial.days, label: s.plans.trial.days + "-day trial" }, premium: { paise: Math.round(s.plans.premium.price * 100), days: s.plans.premium.days, label: "Premium - " + s.plans.premium.days + " days" } };
   };
   // Read at call time so the keys can be set (or changed) without code changes.
   const cfg = () => ({
