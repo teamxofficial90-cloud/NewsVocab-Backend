@@ -51,28 +51,36 @@ const MIN_FRESH_WORDS = 50;      // if fewer unmarked (not yet learned) words th
 const ENABLE_THINKING = /^(1|true|on|yes)$/i.test(process.env.NVIDIA_ENABLE_THINKING || "");
 const NVIDIA_MAX_TOKENS = envInt("NVIDIA_MAX_TOKENS", 4096);
 
-const SYSTEM = `You are an expert English vocabulary teacher who reads newspaper articles and editorials.
+const SYSTEM = `You are an expert English teacher who prepares Indian students for competitive exams (SSC CGL/CHSL, IBPS/SBI Bank PO and Clerk, RBI, UPSC, CLAT). You read newspaper articles and editorials and pick the words that are most valuable for the English section of those exams.
 Return ONLY a JSON object, with no commentary and no markdown fences.`;
 
 function buildPrompt({ title, text, limit, candidateCount }) {
   return `From the article below, choose ${candidateCount} candidate vocabulary words, best first. The learner needs ${limit} final words, so a few extra candidates are a safety margin.
 
-Choose words that are:
-- important in journalism and editorials, advanced but practical, useful for comprehension, interviews, competitive exams and professional communication;
+WHO THE LEARNER IS: a student preparing for Indian government and bank exams. They already know everyday English and common news words. They want words that appear in exam Reading Comprehension passages, Cloze tests, Synonyms/Antonyms questions, One-word substitution and Error spotting.
+
+CHOOSE words that are:
+- upper-intermediate to advanced: the kind of word an educated reader may still need to look up (for example: scrutinise, mitigate, exacerbate, ambivalent, expedite, culpable, tenuous);
+- common in editorials, formal writing and exam passages, and useful again in other contexts;
+- good for exam questions: they have clear synonyms or antonyms, or are easily confused with a similar word (for example discrepancy / disparity);
 - used in the article in a sense that its context makes clear.
 
-Never choose: common words (the, is, have, good), names of people/places/organizations, dates, numbers, abbreviations, or words picked just because they are long. No duplicates. Each "word" must be ONE word, copied exactly as spelled in the article, in lower case.
+SKIP: everyday or easy words, even if they appear in the news (for example: claim, misleading, report, serious, important, increase, decision, support, issue); names of people, places or organisations; dates, numbers, abbreviations; words chosen only because they are long; words that are only technical terms of one narrow field. No duplicates, and no two words from the same word family (for example not both "regulate" and "regulatory").
+If the article has few hard words, choose the hardest ones it has. Never invent a word that is not in the article.
+Order: put the words with the highest exam value first.
 
 IMPORTANT: in the article text, every word the learner has already studied is wrapped in square brackets, like [stalled]. Never choose a bracketed word or any other form of it. You may still use bracketed words to understand the context. The brackets are not part of the article: never put them in any field of your answer.
+
+Each "word" must be ONE word, copied exactly as spelled in the article, in lower case.
 
 For each word give ONE JSON object with exactly these keys, keeping every text short:
 - "word": the word
 - "partOfSpeech": its part of speech (as used in the article)
 - "meaningInContext": what it means in THIS article (max 15 words)
-- "simpleMeaning": the general, plain-English meaning of the word, as a dictionary would give it, that a learner can understand (max 12 words)
-- "exampleSentence": an ORIGINAL example sentence (max 18 words, not copied from the article) using the same meaning and the same word
-- "synonyms": an array of 2 or 3 common synonyms (single words, lower case)
-- "antonyms": an array of 1 to 3 common antonyms (single words, lower case); use [] only if the word truly has no antonym
+- "simpleMeaning": the general dictionary meaning in plain English, as a learner would find it in a good dictionary. It must NOT mention this article, its people, places or events (max 12 words)
+- "exampleSentence": an ORIGINAL example sentence in a formal, news or exam style (max 18 words, not copied from the article, not about the article's story) using the same meaning and the same word
+- "synonyms": an array of 2 or 3 true synonyms (single words, lower case) that could replace the word in a synonym question; leave out words that are only loosely related
+- "antonyms": an array of 1 to 3 true opposites (single words, lower case) that would be correct in an antonym question; use [] if there is no real antonym; never force a weak one
 
 JSON rules: output valid JSON only. Use plain double quotes for keys and strings; never put a double quote inside a text value (use a single quote instead); no trailing commas.
 
@@ -83,6 +91,7 @@ ARTICLE TITLE: ${title}
 ARTICLE TEXT:
 ${text}`;
 }
+
 
 let jsonModeOk = process.env.NVIDIA_JSON_MODE !== "off"; // asks the server to guarantee valid JSON; switched off for good if the endpoint rejects it
 async function callModel(prompt, model = MODEL) {
@@ -159,7 +168,7 @@ async function generateVocabulary({ title, text, limit, history, model }) {
     const err = new Error("Almost nothing new is left in this article: nearly every word in it is already in your history. Try a different article.");
     err.friendly = true; throw err;
   }
-  const candidateCount = Math.min(limit + 3, 30); // a few extra, because candidates that fail validation are skipped (less output = faster)
+  const candidateCount = Math.min(limit + 6, 30); // a few extra, because candidates that fail validation are skipped (the exam-level prompt rejects more; less output = faster)
   const candidates = await askForWords(buildPrompt({ title, text: marked.text, limit, candidateCount }), model);
   // Also rejects any history word (exact or same stem) the model returns anyway.
   const { words } = selectWords(candidates, source, limit, history);
