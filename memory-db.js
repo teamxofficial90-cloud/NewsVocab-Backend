@@ -1,6 +1,6 @@
 // In-memory stand-in for the four MongoDB collections. It supports only what db.js uses (findOne, find().toArray() with
 // {_id: {$in}}, insertOne, insertMany (unordered, duplicates are reported like MongoDB does), updateOne with
-// $set / $addToSet+$each / $unset, unique fields). Used by the tests and by NEWSVOCAB_DB=memory for a quick
+// $set / $addToSet+$each / $unset, unique fields). Used by NEWSVOCAB_DB=memory for a quick
 // trial run. Everything is lost when the process stops, so never use it for real users.
 const same = (a, b) => (a == null && b == null) || a === b;
 const matches = (doc, filter) => Object.keys(filter).every((k) => same(doc[k], filter[k]));

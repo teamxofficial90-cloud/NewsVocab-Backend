@@ -7,10 +7,14 @@
 //     wordLimit: { min: 1, max: 13, default: 10 },   the word-count range the popup offers and its starting number.
 //                                                    `max` is also the DAILY quota (a user can generate at most this many words a day).
 //     freeWords: 3,                                  words of a batch a Free-plan (expired) user is shown
-//     plans: { trial:   { price: 1,  days: 3 },      price in rupees (up to 2 decimals), length in days counting today
-//              premium: { price: 14, days: 30 } },
-//     texts: { tagline, premiumButton, trialButton, premiumInfo, trialInfo }   optional; a missing/blank text = the standard text.
-//            may use {trialDays} {trialPrice} {premiumDays} {premiumPrice} {freeWords} {minLimit} {maxLimit}
+//     plans: { trial:    { price: 1,  days: 3 },     price in rupees (up to 2 decimals), length in days counting today
+//              week:     { price: 7,  days: 7 },     the three paid plans
+//              month:    { price: 14, days: 30 },
+//              twomonth: { price: 25, days: 60 } },
+//              (an older document with plans.premium is read as plans.month)
+//     texts: { tagline, premiumButton, trialButton, premiumInfo, trialInfo}   optional; a missing/blank text = the standard text.
+//            may use {trialDays} {trialPrice} {weekDays} {weekPrice} {monthDays} {monthPrice} {twomonthDays} {twomonthPrice} {freeWords} {minLimit} {maxLimit}
+//            ({premiumDays} {premiumPrice} still work and mean the 1-month plan).
 //   }
 //
 // The server reads the values from memory (get()), which is refreshed from the database at most every `ttlMs` (default 15 s) and at once
@@ -20,7 +24,12 @@
 const DEFAULTS = Object.freeze({
   wordLimit: Object.freeze({ min: 1, max: 13, default: 10 }),
   freeWords: 3,
-  plans: Object.freeze({ trial: Object.freeze({ price: 1, days: 3 }), premium: Object.freeze({ price: 14, days: 30 }) }),
+  plans: Object.freeze({
+    trial: Object.freeze({ price: 1, days: 3 }),
+    week: Object.freeze({ price: 7, days: 7 }),
+    month: Object.freeze({ price: 14, days: 30 }),
+    twomonth: Object.freeze({ price: 25, days: 60 })
+  }),
   texts: Object.freeze({})
 });
 
@@ -29,17 +38,19 @@ const STANDARD_TEXTS = Object.freeze({
   tagline: "Learn vocabulary from the news you read",
   premiumButton: "Get Premium",
   trialButton: "Start {trialDays}-day trial for Rs. {trialPrice}",
-  premiumInfo: "Pay Rs. {premiumPrice} to get {premiumDays} days access",
-  trialInfo: "Pay Rs. {trialPrice} to get {trialDays} days access. After that, Premium is Rs. {premiumPrice} for {premiumDays} days."
+  premiumInfo: "Choose a plan: {weekDays} days for Rs. {weekPrice}, {monthDays} days for Rs. {monthPrice} or {twomonthDays} days for Rs. {twomonthPrice}",
+  trialInfo: "Pay Rs. {trialPrice} to get {trialDays} days access. After that, plans start at Rs. {weekPrice} for {weekDays} days."
 });
 const TEXT_KEYS = Object.keys(STANDARD_TEXTS);
-const TEXT_VARS = ["trialDays", "trialPrice", "premiumDays", "premiumPrice", "freeWords", "minLimit", "maxLimit"]; // the placeholders the popup knows
+const PLAN_IDS = ["trial", "week", "month", "twomonth"];      // the plans, in display order
+const PLAN_NAMES = { trial: "trial", week: "1-week plan", month: "1-month plan", twomonth: "2-month plan" }; // used in the admin error messages
+const TEXT_VARS = ["trialDays", "trialPrice", "weekDays", "weekPrice", "monthDays", "monthPrice", "twomonthDays", "twomonthPrice", "premiumDays", "premiumPrice", "freeWords", "minLimit", "maxLimit"]; // the placeholders the popup knows
 const TEXT_MAX = 300;
 const LIMITS = { maxWords: 30, days: 3650, price: 100000 }; // 30: the most words one article request can ask the AI model for
 
 const isObj = (v) => v && typeof v === "object" && !Array.isArray(v);
 const toNum = (v) => (typeof v === "string" && v.trim() !== "" ? Number(v) : v); // the admin form may send "13" instead of 13
-const fresh = () => ({ wordLimit: { ...DEFAULTS.wordLimit }, freeWords: DEFAULTS.freeWords, plans: { trial: { ...DEFAULTS.plans.trial }, premium: { ...DEFAULTS.plans.premium } }, texts: {} });
+const fresh = () => ({ wordLimit: { ...DEFAULTS.wordLimit }, freeWords: DEFAULTS.freeWords, plans: Object.fromEntries(PLAN_IDS.map((k) => [k, { ...DEFAULTS.plans[k] }])), texts: {} });
 
 // Checks a settings object (the whole set, or part of it: a missing value means the standard one).
 // Returns { ok:true, settings } with clean values (blank texts and unknown keys dropped), or { ok:false, errors: { "dotted.field": message } }.
@@ -73,11 +84,13 @@ function validate(input) {
   if (!errors.freeWords && !errors["wordLimit.max"] && s.freeWords > s.wordLimit.max) errors.freeWords = "The number of Free plan words cannot be larger than the largest word count (" + s.wordLimit.max + ").";
 
   const plans = part("plans");
-  for (const k of ["trial", "premium"]) {
-    const p = plans[k] === undefined ? {} : plans[k];
+  for (const k of PLAN_IDS) {
+    let p = plans[k];
+    if (p === undefined && k === "month") p = plans.premium; // settings saved before the three plans existed call the 1-month plan "premium"
+    if (p === undefined) p = {};
     if (!isObj(p)) { errors["plans." + k] = "This must be an object."; continue; }
-    const name = k === "trial" ? "trial" : "Premium";
-    num(p.price, "plans." + k + ".price", "The " + name + " price", 1, LIMITS.price, (v) => (s.plans[k].price = v), { decimals: true });
+    const name = PLAN_NAMES[k];
+        num(p.price, "plans." + k + ".price", "The " + name + " price", 1, LIMITS.price, (v) => (s.plans[k].price = v), { decimals: true });
     num(p.days, "plans." + k + ".days", "The " + name + " length", 1, LIMITS.days, (v) => (s.plans[k].days = v));
   }
 
@@ -147,4 +160,4 @@ function createSettings({ collection, ttlMs = 15000, now = Date.now } = {}) {
   return { get, refresh, save, view };
 }
 
-module.exports = { createSettings, validate, fresh, DEFAULTS, STANDARD_TEXTS, TEXT_KEYS };
+module.exports = { createSettings, validate, fresh, DEFAULTS, STANDARD_TEXTS, TEXT_KEYS, PLAN_IDS };

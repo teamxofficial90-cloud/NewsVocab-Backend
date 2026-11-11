@@ -215,7 +215,7 @@ async function accountStatus(user) {
 }
 
 // One button for everyone: if the verified Gmail is already in the database the user is logged in,
-// otherwise an account is created for it (no free days: the 3-day trial costs Rs. 1, see premium.js).
+// otherwise an account is created for it (no free days: the trial is a paid plan, see premium.js).
 async function handleGoogleAuth(req, res) {
   const body = await readJson(req, res); if (!body) return;
   try {
@@ -230,7 +230,8 @@ async function handleGoogleAuth(req, res) {
   }
 }
 
-// Manual grant (support, refunds, tests): the user gets 30 days (today + 29) from today. Normal purchases go through Razorpay instead (see premium.js).
+// Manual grant (support, refunds): POST /admin/premium { email, plan? } gives the 1-week ("week"), 1-month ("month", the default) or 2-month ("twomonth") plan from today,
+// with the length set in the admin settings. Normal purchases go through Razorpay instead (see premium.js).
 // Checks the x-admin-key header; answers the request itself and returns false when it is not allowed.
 function adminOk(req, res) {
   const given = String(req.headers["x-admin-key"] || "");
@@ -242,7 +243,9 @@ function adminOk(req, res) {
 async function handleGrantPremium(req, res) {
   if (!adminOk(req, res)) return;
   const body = await readJson(req, res); if (!body) return;
-  const user = typeof body.email === "string" ? await db.grantPremium(body.email) : null;
+  const plan = body.plan === undefined ? "month" : body.plan;
+  if (!["week", "month", "twomonth"].includes(plan)) return send(res, 400, { error: 'plan must be "week", "month" or "twomonth".' });
+  const user = typeof body.email === "string" ? await db.grantPlan(body.email, plan) : null;
   if (!user) return send(res, 404, { error: "No account with that email. The user must sign in once first." });
   send(res, 200, { email: user.email, account: await accountStatus(user) });
 }
@@ -288,12 +291,15 @@ async function handleRazorpayWebhook(req, res) {
   }
 }
 
-// The popup's Get Premium / Start trial button: creates a Razorpay payment page for this user (Rs. 14 Premium, or the Rs. 1 trial for
-// body { plan: "trial" }; no body = Premium) and returns its address.
+// Starts a purchase: body { plan: "trial" | "week" | "month" | "twomonth" } ("premium" or no plan = "month"). Creates the Razorpay payment page for that plan
+// at the price set in the admin settings and returns its address { url }. Logged-in users only (the same session token as the other /api calls).
 async function handleCheckout(req, res, user) {
   const raw = await readRaw(req, res); if (!raw) return;
-  let plan = "premium";
-  try { const b = raw.length ? JSON.parse(raw.toString("utf8")) : {}; if (b && b.plan === "trial") plan = "trial"; } catch (e) { return send(res, 400, { error: "Invalid JSON body." }); }
+  let plan = "month";
+  try {
+    const b = raw.length ? JSON.parse(raw.toString("utf8")) : {};
+    if (b && b.plan !== undefined && b.plan !== "premium") plan = String(b.plan);
+  } catch (e) { return send(res, 400, { error: "Invalid JSON body." }); }
   try { const r = await premium.createCheckout(user, plan); send(res, 200, { url: r.url, ...(r.pageMode ? { pageMode: true, email: user.email } : {}) }); }
   catch (e) { console.error("[checkout]", e.message); send(res, e.status || 500, { error: e.friendly ? e.message : "Could not start the payment. Please try again." }); }
 }
@@ -543,7 +549,8 @@ async function handleAck(req, res, user) {
 async function handleConfig(res) {
   await settings.refresh().catch(() => {}); // a fresh read: the popup must not show prices that are older than the server's own
   res.writeHead(200, { "content-type": "application/json; charset=utf-8", "access-control-allow-origin": "*", "cache-control": "public, max-age=30" });
-  res.end(JSON.stringify({ settings: settings.get() }));
+  const cur = settings.get();
+  res.end(JSON.stringify({ settings: { ...cur, plans: { ...cur.plans, premium: cur.plans.month } } })); // `premium` = the 1-month plan, for popups from before the three plans
 }
 async function handleAdminSettings(req, res) {
   if (!adminOk(req, res)) return;
@@ -655,10 +662,10 @@ async function start(collections, opts = {}) {
   await new Promise((resolve) => server.listen(PORT, HOST, resolve));
   console.log("NewsVocab backend listening on http://" + (HOST === "127.0.0.1" ? "localhost" : HOST) + ":" + server.address().port + " (model: " + MODEL + ")");
   if (!process.env.NVIDIA_API_KEY) console.warn("WARNING: NVIDIA_API_KEY is not set; /api/vocab will return an error until it is.");
-  if (!premium.configured()) console.warn("WARNING: neither RAZORPAY_PAYMENT_PAGE_URL nor RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET is set; the Get Premium button cannot start a payment until one is.");
-  else if (premium.pageMode() && !premium.webhookConfigured()) console.warn("WARNING: RAZORPAY_PAYMENT_PAGE_URL is set but RAZORPAY_WEBHOOK_SECRET is not: a payment made on the page can only be confirmed by the webhook, so no plan will be extended until you add it.");
+  if (!premium.configured()) console.warn("WARNING: none of RAZORPAY_PAGE_MODE=on, RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET or a RAZORPAY_*_PAGE_URL is set, so no payment can be confirmed.");
+  else if (premium.pageMode() && !premium.webhookConfigured()) console.warn("WARNING: payment page mode is on but RAZORPAY_WEBHOOK_SECRET is not: a payment made on a payment page can only be confirmed by the webhook, so no plan will be extended until you add it.");
   else if (!premium.webhookConfigured()) console.warn("NOTE: RAZORPAY_WEBHOOK_SECRET is not set; payments are confirmed only when the popup checks (no webhook).");
-  if (premium.pageMode() && !(process.env.RAZORPAY_PAYMENT_PAGE_URL && process.env.RAZORPAY_TRIAL_PAGE_URL)) console.warn("WARNING: payment page mode needs BOTH RAZORPAY_PAYMENT_PAGE_URL (Rs. 14 Premium page) and RAZORPAY_TRIAL_PAGE_URL (Rs. 1 trial page); the plan whose page is missing cannot be bought.");
+  if (premium.pageMode() && ["RAZORPAY_TRIAL_PAGE_URL", "RAZORPAY_WEEK_PAGE_URL", "RAZORPAY_PAYMENT_PAGE_URL", "RAZORPAY_MONTH_PAGE_URL", "RAZORPAY_TWOMONTH_PAGE_URL"].some((k) => process.env[k])) { const missing = [["RAZORPAY_TRIAL_PAGE_URL", "trial"], ["RAZORPAY_WEEK_PAGE_URL", "1-week"], ["RAZORPAY_PAYMENT_PAGE_URL", "1-month"], ["RAZORPAY_TWOMONTH_PAGE_URL", "2-month"]].filter(([k]) => !process.env[k] && !(k === "RAZORPAY_PAYMENT_PAGE_URL" && process.env.RAZORPAY_MONTH_PAGE_URL)); if (missing.length) console.warn("WARNING: payment page mode needs one Razorpay payment page per plan; missing: " + missing.map(([k, n]) => k + " (" + n + ")").join(", ") + ". A plan whose page is missing cannot be bought."); }
   if (!process.env.GOOGLE_CLIENT_ID) console.warn("WARNING: GOOGLE_CLIENT_ID is not set; nobody can sign in until it is.");
   if (!process.env.SESSION_SECRET) console.warn("WARNING: SESSION_SECRET is not set; a random one is used, so users are logged out on every restart.");
   return server;

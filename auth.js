@@ -45,6 +45,7 @@ function createAuth({ clientId, secret, tokeninfoUrl, db, sessionDays }) {
     if (!p || typeof p.email !== "string" || !(p.exp > Date.now())) return null;
     return db.getUser(p.email); // null if the account no longer exists
   }
+
   const userFromRequest = async (req) => readSession(((req.headers.authorization || "").match(/^Bearer (.+)$/) || [])[1]);
 
   const publicUser = (u) => ({ email: u.email });

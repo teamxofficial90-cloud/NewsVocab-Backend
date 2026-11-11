@@ -24,7 +24,8 @@
 //  - Signup: NO free days. expiry_date = today (the Free plan) and trial_used = false (the one Rs. 1 trial may still be bought); daily_quota = 13, last_used = empty,
 //    ref_pending = true (the one chance to enter a friend's referral code, see rewards.js; ends when the code is used or skipped).
 //  - Trial (Rs. 1, once per account, see grantTrial): last valid day = today + 2 (3 days), so expiry_date = today + 3. Saved bonus days are NOT used by it.
-//  - Premium (Rs. 14): last valid day = today + 29 (30 days), so expiry_date = today + 30, plus any saved bonus days (rewards, see rewards.js).
+//  - Paid plans (see grantPlan): "week" (default 7 days), "month" (30) and "twomonth" (60); price and length are set in the admin (settings.js). The last valid day
+//    is today + (days - 1), so expiry_date = today + days, plus any saved bonus days (rewards, see rewards.js).
 //    A payment never shortens a plan: if the account already runs longer than the new plan would, the later date is kept.
 //  - The full plan ("Premium" in the popup, trial included) works on every date strictly before expiry_date. After that the account
 //    is on the "Free" plan: it generates exactly like before (same 1-13 range, same daily quota of 13, all words saved to the
@@ -36,9 +37,11 @@
 //  - Older histories (`words: ["stringent", ...]` as text, or `entries: [{ word, meaning }]`) are still read, and are
 //    converted to numbers the next time words are added (their details in the old string-keyed dictionary documents are kept).
 const { pack, unpack, MAX_ID } = require("./pack");
-// TRIAL_DAYS / PREMIUM_DAYS: the LAST valid day is today + N, so the plan covers N + 1 days counting today (2 -> 3 trial days, 29 -> 30 premium days).
-// expiry_date (stored) is the first day the plan no longer works, i.e. today + N + 1.
-const TRIAL_DAYS = 2, PREMIUM_DAYS = 29, DAILY_QUOTA = 13;
+// TRIAL_DAYS / WEEK_DAYS / PREMIUM_DAYS (the 1-month plan) / TWOMONTH_DAYS: the LAST valid day is today + N, so the plan covers N + 1 days counting today
+// (2 -> 3 trial days, 6 -> 7 days, 29 -> 30 days, 59 -> 60 days). expiry_date (stored) is the first day the plan no longer works, i.e. today + N + 1.
+// These are the standard values; the admin settings (settings.js) override them.
+const TRIAL_DAYS = 2, WEEK_DAYS = 6, PREMIUM_DAYS = 29, TWOMONTH_DAYS = 59, DAILY_QUOTA = 13;
+const PAID_PLANS = { week: WEEK_DAYS, month: PREMIUM_DAYS, twomonth: TWOMONTH_DAYS };
 const FREE_WORDS = 3;   // a user whose plan has expired (the "Free" plan) is SHOWN only the first this-many words of a batch, and gets no downloads
 const DUPLICATE_KEY = 11000;  // MongoDB error code for a unique-index clash
 const RETRIES = 10;
@@ -60,7 +63,7 @@ function createDb({ users, histories, dictionary, counters, jobs, articles, paym
   const live = () => (settings ? settings.get() : null);
   const dailyQuota = () => { const s = live(); return s ? s.wordLimit.max : DAILY_QUOTA; };       // the daily quota is the largest word count
   const freeWords = () => { const s = live(); return s ? s.freeWords : FREE_WORDS; };
-  const premiumDays = () => { const s = live(); return s ? s.plans.premium.days - 1 : PREMIUM_DAYS; }; // stored as "last valid day = today + N"
+  const planDays = (plan) => { const s = live(); return s ? s.plans[plan].days - 1 : PAID_PLANS[plan]; }; // stored as "last valid day = today + N"
   const trialDays = () => { const s = live(); return s ? s.plans.trial.days - 1 : TRIAL_DAYS; };
   const tz = timezone || "Asia/Kolkata";
   const todayFn = today || (() => dateInZone(tz)); // tests can pass a fake clock
@@ -96,21 +99,23 @@ function createDb({ users, histories, dictionary, counters, jobs, articles, paym
     return user;
   }
 
-  // Gives an existing account PREMIUM_DAYS days counted from today (30 days counting today), PLUS the bonus days it has saved up from
-  // rewards (they are used up here: bonus_days goes back to 0 in the same write). A plan that already runs longer is never shortened.
-  // Returns null if there is no such account.
-  async function grantPremium(email) {
+  // Gives an existing account the days of a paid plan ("week", "month" or "twomonth"; the length comes from the admin settings) counted from today,
+  // PLUS the bonus days it has saved up from rewards (they are used up here: bonus_days goes back to 0 in the same write).
+  // A plan that already runs longer is never shortened. Returns null if there is no such account.
+  async function grantPlan(email, plan) {
+    if (!Object.prototype.hasOwnProperty.call(PAID_PLANS, plan)) throw new Error("Unknown plan: " + plan);
     for (let i = 0; i < RETRIES; i++) {
       const u = await getUser(email);
       if (!u) return null;
       const bonus = u.bonus_days || 0;
-      const until = addDays(todayFn(), premiumDays() + 1 + bonus);
+      const until = addDays(todayFn(), planDays(plan) + 1 + bonus);
       const r = await users.updateOne({ _id: u._id, bonus_days: u.bonus_days === undefined ? null : u.bonus_days, expiry_date: u.expiry_date },
                                       { $set: { expiry_date: until > u.expiry_date ? until : u.expiry_date, bonus_days: 0 } });
       if (r.matchedCount === 1) return getUser(email);
     }
     throw new Error("The account is busy. Please try again.");
   }
+  const grantPremium = (email) => grantPlan(email, "month"); // the 1-month plan (the old single Premium plan)
 
   // The paid trial (Rs. 1): TRIAL_DAYS days counted from today (3 days counting today), once per account. Accounts created before the trial
   // was paid have no trial_used flag and count as having used theirs. The flag flips in the same compare-and-set write as the date, so two
@@ -142,7 +147,7 @@ function createDb({ users, histories, dictionary, counters, jobs, articles, paym
     throw new Error("The account is busy. Please try again.");
   }
 
-  // Reward days with "apply": "next_premium" are NOT applied at once: they are saved on the account (`bonus_days`) and added to the next Premium plan (see grantPremium).
+  // Reward days with "apply": "next_premium" are NOT applied at once: they are saved on the account (`bonus_days`) and added to the next paid plan (see grantPlan).
   // Compare-and-set, so two rewards at the same moment both count. Returns the updated user, or null if there is no such account.
   async function addBonus(email, days) {
     for (let i = 0; i < RETRIES; i++) {
@@ -501,7 +506,7 @@ function createDb({ users, histories, dictionary, counters, jobs, articles, paym
   const undecideReward = (key) => needRewards().updateOne({ key }, { $set: { status: "pending" } });
 
   // ----- premium payments (see premium.js): one document per Razorpay payment link this server created -----
-  // { pid: payment link id (unique), user_id, email, plan: "trial" | "premium" (missing = premium), amount (paise), currency, status: "created" | "granted", url, created, expires_at, payment_id?, paid_at?, source? }
+  // { pid: payment link id (unique), user_id, email, plan: "trial" | "week" | "month" | "twomonth" ("premium" or missing = month), amount (paise), currency, status: "created" | "granted", url, created, expires_at, payment_id?, paid_at?, source? }
   // status "created" -> "granted" is a compare-and-set, so a payment extends the plan exactly once however many webhooks / checks arrive.
   const needPayments = () => { if (!payments) throw new Error("The payments collection is not available."); return payments; };
 
@@ -527,9 +532,9 @@ function createDb({ users, histories, dictionary, counters, jobs, articles, paym
   // Puts a claimed link back to "created" (the grant itself failed), so it can be settled again.
   const releaseCheckout = (pid) => needPayments().updateOne({ pid, status: "granted" }, { $set: { status: "created" } });
 
-  return { ping, recordPagePayment, releasePagePayment, saveCheckout, getCheckout, listCheckouts, claimCheckout, releaseCheckout, getUser, createUser, claimJob, getArticle, putArticle, updateArticleWords, finishJob, failJob, dropJob, getJob, ackJob, grantPremium, grantTrial, getHistory, getHistoryState, getHistoryDetails, addHistory, saveDictionary, getDetails, status, isActive, consume, refund, extendDays, addBonus, getRefCode, findByRefCode, claimReferral, reopenReferral, closeReferral, insertReward, getReward, deleteReward, listRewards, listPendingRewards, decideReward, undecideReward,
+  return { ping, recordPagePayment, releasePagePayment, saveCheckout, getCheckout, listCheckouts, claimCheckout, releaseCheckout, getUser, createUser, claimJob, getArticle, putArticle, updateArticleWords, finishJob, failJob, dropJob, getJob, ackJob, grantPremium, grantPlan, grantTrial, getHistory, getHistoryState, getHistoryDetails, addHistory, saveDictionary, getDetails, status, isActive, consume, refund, extendDays, addBonus, getRefCode, findByRefCode, claimReferral, reopenReferral, closeReferral, insertReward, getReward, deleteReward, listRewards, listPendingRewards, decideReward, undecideReward,
            // live values (getters), so a settings change shows here too
-           constants: { get TRIAL_DAYS() { return trialDays(); }, get PREMIUM_DAYS() { return premiumDays(); }, get DAILY_QUOTA() { return dailyQuota(); }, get FREE_WORDS() { return freeWords(); } }, addDays };
+           constants: { get TRIAL_DAYS() { return trialDays(); }, get WEEK_DAYS() { return planDays("week"); }, get PREMIUM_DAYS() { return planDays("month"); }, get TWOMONTH_DAYS() { return planDays("twomonth"); }, get DAILY_QUOTA() { return dailyQuota(); }, get FREE_WORDS() { return freeWords(); } }, addDays };
 }
 
-module.exports = { createDb, TRIAL_DAYS, PREMIUM_DAYS, DAILY_QUOTA, FREE_WORDS, dateInZone, addDays };
+module.exports = { createDb, TRIAL_DAYS, WEEK_DAYS, PREMIUM_DAYS, TWOMONTH_DAYS, DAILY_QUOTA, FREE_WORDS, dateInZone, addDays };
