@@ -677,7 +677,7 @@ async function start(collections, opts = {}) {
   const server = http.createServer((req, res) => {
     route(req, res).catch((e) => {
       console.error("[server error]", e && e.stack || e);
-      if (!res.headersSent) send(res, 500, { error: "Server error. Please try again." });
+      if (!res.headersSent) send(res, 500, { error:   "Server error. Please try again." });
     });
   });
   await new Promise((resolve) => server.listen(PORT, HOST, resolve));
