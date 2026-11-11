@@ -401,7 +401,8 @@ const queueKey = (user, jobId) => String(user._id) + ":" + jobId;
 
 async function processVocab(user, { title, text, limit, jobId }) {
   // Expired plan = the Free plan: same word range and same daily quota as before (so it cannot be used to generate again and again),
-  // but the popup shows only the first FREE_WORDS words and locks the downloads. All the words are generated, charged and saved to the history.
+  // but only the first FREE_WORDS words ever leave the server and are saved to the history (so no edited popup can show or export more, and the history file of a
+  // Free user holds only those words). The full number of words is still generated and charged against today's quota.
   const free = !db.isActive(user);
   // Check the plan date and today's quota, and subtract the requested words BEFORE generating anything.
   // The history is read at the same time (one round trip less); if the check fails it is simply not used.
@@ -462,17 +463,21 @@ async function processVocab(user, { title, text, limit, jobId }) {
 
   // One save: new words get their permanent numbers and their general details go into the shared dictionary (a word that is
   // already there is left as it is), and the numbers are added to the user's history (packed, 3 bytes per word).
+  // A Free user gets, and keeps in the history, only the first FREE_WORDS words. The others are neither returned, nor stored in the saved job result, nor in the history
+  // (so they can still be found in a later article once the user has paid).
+  const shown = free ? result.words.slice(0, db.constants.FREE_WORDS) : result.words;
+  const hidden = result.words.length - shown.length;
   let added = 0;
-  try { added = await db.addHistory(user._id, result.words, hist.state); } // reuses the history read at the start
+  try { if (shown.length) added = await db.addHistory(user._id, shown, hist.state); } // reuses the history read at the start
   catch (e) {
     console.error("[history save]", e.message);
     warning = (warning ? warning + ". " : "") + "The words were generated but could not be saved to your history.";
   }
   await refunding;
   const quota = { remainingToday: remaining, validUntil: q.validUntil, historyCount: history.length + added };
-  const body = { jobId, words: result.words, ...(warning ? { warning } : {}), ...(free ? { free: true } : {}), quota };
+  const body = { jobId, words: shown, ...(warning ? { warning } : {}), ...(free ? { free: true, hidden } : {}), quota };
   // The words are now in the user's history, so they must not be lost: keep them for the popup until it confirms it has them.
-  const saved = { jobId, words: result.words, ...(warning ? { warning } : {}), ...(free ? { free: true } : {}), quota };
+  const saved = { jobId, words: shown, ...(warning ? { warning } : {}), ...(free ? { free: true, hidden } : {}), quota };
   await db.finishJob(user._id, jobId, saved).catch((e) => console.error("[job save]", e.message));
   return { status: 200, body };
 }
@@ -516,7 +521,14 @@ async function handleVocab(req, res, user) {
 async function handleLastResult(res, user) {
   const j = await db.getJob(user._id);
   if (j.status === "none") return send(res, 200, { status: "none" });
-  if (j.status === "done") return send(res, 200, { ...j.result, status: "done", jobId: j.jobId });
+  if (j.status === "done") {
+    // The plan may have expired while the popup was closed: a result made under the full plan is cut to the Free words when it is collected.
+    const r = j.result || {}, keep = db.constants.FREE_WORDS;
+    if (!db.isActive(user) && Array.isArray(r.words) && r.words.length > keep) {
+      return send(res, 200, { ...r, words: r.words.slice(0, keep), free: true, hidden: r.words.length - keep, status: "done", jobId: j.jobId });
+    }
+    return send(res, 200, { ...r, status: "done", jobId: j.jobId });
+  }
   if (j.status === "failed") return send(res, 200, { status: "failed", jobId: j.jobId, error: j.error });
   send(res, 200, { status: "running", jobId: j.jobId });
 }

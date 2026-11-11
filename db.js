@@ -28,8 +28,8 @@
 //    is today + (days - 1), so expiry_date = today + days, plus any saved bonus days (rewards, see rewards.js).
 //    A payment never shortens a plan: if the account already runs longer than the new plan would, the later date is kept.
 //  - The full plan ("Premium" in the popup, trial included) works on every date strictly before expiry_date. After that the account
-//    is on the "Free" plan: it generates exactly like before (same 1-13 range, same daily quota of 13, all words saved to the
-//    history), but the popup shows only the first FREE_WORDS (3) words, and the history download is refused (the popup also locks the DOCX).
+//    is on the "Free" plan: it generates exactly like before (same 1-13 range, same daily quota of 13, charged for all the words), but the server returns and saves to the
+//    history only the first FREE_WORDS (3) words of a batch, and the history download is refused.
 //  - Each request: if last_used is today, daily_quota is what is left today; otherwise today starts at a fresh 13.
 //    If the requested words fit, daily_quota is reduced and last_used set to today BEFORE anything is generated.
 //  - Adding words to a history is read-change-write guarded by `ver` (compare-and-set): if another request changed the
